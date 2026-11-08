@@ -1,0 +1,63 @@
+# No Payne fork (see NOPAYNE-FORK.md): builds the Docker image production runs.
+# Push a tag like nopayne-v1.205.6-1 on the nopayne branch to publish
+#   ghcr.io/jopdop30/adam-rms:<tag>  and  ghcr.io/jopdop30/adam-rms:nopayne-latest
+# Deploy by the explicit <tag>, never by nopayne-latest.
+name: No Payne image
+
+on:
+  push:
+    tags:
+      - "nopayne-v*"
+
+permissions:
+  contents: read
+  packages: write
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: false
+
+env:
+  REGISTRY_IMAGE: ghcr.io/jopdop30/adam-rms
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out code
+        uses: actions/checkout@v4
+
+      - name: Write version number
+        run: |
+          mkdir -p src/version
+          echo "$TAG" > src/version/TAG.txt
+        env:
+          TAG: ${{ github.ref_name }}
+
+      - name: Set up Docker buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Log in to GitHub Container Registry
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Build and push
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: ./Dockerfile
+          platforms: linux/amd64
+          push: true
+          tags: |
+            ${{ env.REGISTRY_IMAGE }}:${{ github.ref_name }}
+            ${{ env.REGISTRY_IMAGE }}:nopayne-latest
+          labels: |
+            org.opencontainers.image.source=https://github.com/jopdop30/adam-rms
+            org.opencontainers.image.revision=${{ github.sha }}
+            org.opencontainers.image.version=${{ github.ref_name }}
+            org.opencontainers.image.licenses=AGPL-3.0
+          cache-from: type=gha,scope=nopayne
+          cache-to: type=gha,mode=max,scope=nopayne

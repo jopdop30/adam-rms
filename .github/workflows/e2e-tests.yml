@@ -4,6 +4,7 @@ on:
   pull_request:
     branches:
       - main
+      - nopayne # No Payne fork: run the suite on PRs into the fork's release branch too
 
 permissions:
   contents: read
