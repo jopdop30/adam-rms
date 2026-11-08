@@ -45,6 +45,7 @@ $PAGEDATA['clients'] = [];
 foreach ($clients as $client) {
 	$DBLIB->where("clients_id", $client['clients_id']);
 	$DBLIB->where("projects_deleted", 0);
+	nopayneProjectScopeWhere(); // No Payne fork: per-project access control
 	$DBLIB->join("projectsTypes", "projects.projectsTypes_id=projectsTypes.projectsTypes_id");
 	$DBLIB->join("projectsStatuses", "projects.projectsStatuses_id=projectsStatuses.projectsStatuses_id", "LEFT");
 	$DBLIB->where("projectsTypes.projectsTypes_config_finance", 1);

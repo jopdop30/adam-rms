@@ -13,6 +13,7 @@ $DBLIB->join("projects","projectsVacantRoles.projects_id=projects.projects_id","
 $DBLIB->join("clients", "projects.clients_id=clients.clients_id", "LEFT");
 $DBLIB->join("users", "projects.projects_manager=users.users_userid", "LEFT");
 $DBLIB->where("projects.instances_id", $AUTH->data['instance']['instances_id']);
+nopayneProjectScopeWhere(); // No Payne fork: per-project access control
 $DBLIB->where("projects.projects_deleted", 0);
 $DBLIB->where("projects.projects_archived", 0);
 $DBLIB->where("(projects.projects_dates_use_end IS NULL OR projects.projects_dates_use_end >= '" . date("Y-m-d H:i:s") . "')");

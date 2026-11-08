@@ -386,3 +386,4 @@ if ($CONFIG['CSP_ENABLED'] === "Enabled") {
 // Include the Auth class
 require_once __DIR__ . '/libs/Auth/main.php';
 $GLOBALS['AUTH'] = new bID;
+require_once __DIR__ . '/libs/Auth/nopayneProjectScope.php'; // No Payne fork: per-project access control

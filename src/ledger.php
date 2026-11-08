@@ -15,6 +15,7 @@ $DBLIB->pageLimit = 20; //Users per page
 $DBLIB->join("projects", "payments.projects_id=projects.projects_id", "LEFT");
 $DBLIB->join("clients", "projects.clients_id=clients.clients_id", "LEFT");
 $DBLIB->where("projects.instances_id",$AUTH->data['instance']['instances_id']);
+nopayneProjectScopeWhere(); // No Payne fork: per-project access control
 $DBLIB->where("payments.payments_deleted", 0);
 $DBLIB->where("payments.payments_type", 1);
 $DBLIB->orderBy("payments.payments_date", "DESC");

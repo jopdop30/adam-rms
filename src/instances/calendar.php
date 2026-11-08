@@ -26,6 +26,8 @@ if (isset($_GET['location'])) {
 } else $PAGEDATA['LOCATION'] = false;
 
 $DBLIB->where("projects.instances_id", $AUTH->data['instance']['instances_id']);
+nopayneProjectScopeWhere(); // No Payne fork: per-project access control
+if (nopayneProjectScopeRestricted()) $PAGEDATA['USERDATA']['instance']['instances_calendarHash'] = null; // No Payne fork: the business feed has every project in it
 if ($PAGEDATA['LOCATION']) $DBLIB->where("projects.locations_id", $PAGEDATA['LOCATION']['locations_id']);
 else $DBLIB->where("projects.projects_archived", 0);
 $DBLIB->where("projects.projects_deleted", 0);

@@ -48,6 +48,7 @@ $DBLIB->orderBy("projects.projects_dates_use_start", "ASC");
 $DBLIB->orderBy("projects.projects_dates_use_end", "ASC");
 $DBLIB->orderBy("projects.projects_name", "ASC");
 $DBLIB->where("projects.instances_id",  $AUTH->data['instance']['instances_id']);
+nopayneProjectScopeWhere(); // No Payne fork: per-project access control
 $PAGEDATA['user']['crewAssignments'] = $DBLIB->get("crewAssignments", null, ["crewAssignments.*", "projects.projects_dates_use_start", "projects.projects_dates_use_end", "projects.projects_name", "clients.clients_name", "projects.projects_id", "projectsStatuses.projectsStatuses_name", "projectsStatuses.projectsStatuses_foregroundColour","projectsStatuses.projectsStatuses_backgroundColour"]);
 
 //Project Manager Roles
@@ -55,6 +56,7 @@ $DBLIB->join("clients", "projects.clients_id=clients.clients_id", "LEFT");
 $DBLIB->join("projectsStatuses", "projects.projectsStatuses_id=projectsStatuses.projectsStatuses_id", "LEFT");
 $DBLIB->where("projectsStatuses.projectsStatuses_assetsReleased", 0);
 $DBLIB->where("projects.projects_manager",  $PAGEDATA['user']['users_userid']);
+nopayneProjectScopeWhere(); // No Payne fork: per-project access control
 $DBLIB->orderBy("projects.projects_dates_use_start", "ASC");
 $DBLIB->where("projects.instances_id",  $AUTH->data['instance']['instances_id']);
 $DBLIB->orderBy("projects.projects_dates_use_end", "ASC");

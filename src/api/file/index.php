@@ -1,5 +1,6 @@
 <?php
 require_once __DIR__ . '/../apiHead.php';
+nopayneProjectScopeRequestGuard(); // No Payne fork: per-project access control
 /*
  * File interface for Amazon AWS S3.
  *  Parameters

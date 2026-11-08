@@ -5,6 +5,7 @@ $return = [];
 if (!$AUTH->instancePermissionCheck("PROJECTS:VIEW")) die("401");
 
 $DBLIB->where("projects.instances_id", $AUTH->data['instance']['instances_id']);
+nopayneProjectScopeWhere(); // No Payne fork: per-project access control
 $DBLIB->where("projects.projects_deleted", 0);
 $DBLIB->where("projects.projects_archived", 0);
 $DBLIB->join("clients", "projects.clients_id=clients.clients_id", "LEFT");
@@ -23,6 +24,7 @@ foreach ($projects as $project) {
 
     if (isset($_POST['subprojects'])) {
         $DBLIB->where("projects.projects_parent_project_id", $project['projects_id']);
+        nopayneProjectScopeWhere(); // No Payne fork: per-project access control
         $DBLIB->where("projects.projects_deleted", 0);
         $DBLIB->where("projects.projects_archived", 0);
         $DBLIB->join("clients", "projects.clients_id=clients.clients_id", "LEFT");

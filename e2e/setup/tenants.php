@@ -105,7 +105,7 @@ function tenant(string $letter): array {
     ]);
 
     $fullPosition = upsert("instancePositions", "instancePositions_id", ["instances_id" => $instance, "instancePositions_displayName" => "$marker full access"], [
-        "instancePositions_rank" => 1, "instancePositions_deleted" => 0, "instancePositions_actions" => implode(",", array_keys($instanceActions)), "cmsPages_id" => null,
+        "instancePositions_rank" => 1, "instancePositions_deleted" => 0, "instancePositions_actions" => implode(",", array_diff(array_keys($instanceActions), ["PROJECTS:VIEW:ONLY_ASSIGNED"])), "cmsPages_id" => null, // No Payne fork: the restriction isn't a grant
     ]);
     $limitedPosition = upsert("instancePositions", "instancePositions_id", ["instances_id" => $instance, "instancePositions_displayName" => "$marker limited"], [
         "instancePositions_rank" => 2, "instancePositions_deleted" => 0, "instancePositions_actions" => implode(",", LIMITED_PERMISSIONS), "cmsPages_id" => null,
