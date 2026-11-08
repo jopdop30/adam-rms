@@ -1679,6 +1679,18 @@ $instanceActions = [
     'LEGACY-ID' => 20,
     'LEGACY-Sort Rank' => 14,
   ],
+  // No Payne fork (see NOPAYNE-FORK.md and Auth/nopayneProjectScope.php): a restriction, not a grant
+  'PROJECTS:VIEW:ONLY_ASSIGNED' => [
+    'Category' => 'Projects',
+    'Table' => 'Projects',
+    'Type' => 'View',
+    'Detail' => 'Only Assigned',
+    'Combined Text Description' => 'Projects: View  - Only Assigned (RESTRICTS the user to projects they manage or are crew on)',
+    'Dependencies' => ['PROJECTS:VIEW'],
+    'Comment' => 'Restricts the user to projects they manage or are crew on',
+    'Supported Token Types' => ["web-session", "app-v1", "app-v2-magic-email"],
+    'Caution' => 'This takes access away: a user with it can only see and change projects they manage or are crew on',
+  ],
   'TRAINING:CREATE' => [
     'Category' => 'Training',
     'Table' => 'Training',

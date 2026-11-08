@@ -1,0 +1,575 @@
+From b2a90e678d7f8d937cfb5e8a13d0a795ec519f5a Mon Sep 17 00:00:00 2001
+From: jopdop30 <jopdop30@users.noreply.github.com>
+Date: Sun, 8 Nov 2026 12:44:35 +0000
+Subject: [PATCH 5/5] Project scope: sub-projects inherit access from their
+ parent
+
+A restricted user who manages or is crew on a project now also reaches
+all its sub-projects, to any depth (cycles of parents are guarded).
+Being on a sub-project still doesn't reach its parent or siblings.
+
+The sidebar, projects page and api/projects/list.php nest sub-projects
+under their parents; for a restricted user, a sub-project whose parent
+is out of reach is now listed at top level instead of vanishing. The
+crew vacancies page no longer names a parent project out of reach.
+
+Tests: children and grandchildren via manager and via crew, a parent
+the user isn't on with a child they are crew on, a sibling, asset
+add/remove on sub-projects, unrestricted users unchanged, and a cycle.
+
+Docs: behaviour, audit, checklist, and the decision to leave inventory
+values visible to restricted users.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ NOPAYNE-FORK.md                               |  67 +++++---
+ .../nopayne-project-scope.spec.ts             | 150 +++++++++++++++++-
+ e2e/setup/nopayneProjectScope.php             |  32 ++--
+ src/api/projects/list.php                     |   2 +-
+ src/common/headSecure.php                     |   2 +-
+ src/common/libs/Auth/nopayneProjectScope.php  |  39 ++++-
+ src/project/crew/vacancies.php                |   1 +
+ src/project/list.php                          |   2 +-
+ 8 files changed, 258 insertions(+), 37 deletions(-)
+
+diff --git a/NOPAYNE-FORK.md b/NOPAYNE-FORK.md
+index e2cfc391..90a98f65 100644
+--- a/NOPAYNE-FORK.md
++++ b/NOPAYNE-FORK.md
+@@ -2,7 +2,7 @@
+ 
+ This is No Payne Productions' fork of [AdamRMS](https://github.com/adam-rms/adam-rms), run at
+ our AdamRMS instance. It adds one feature, **per-project access control**, so an outside client can have an
+-account that only sees and changes the project(s) they are on.
++account that only sees and changes the project(s) they are on, and those projects' sub-projects.
+ 
+ ## 1. Purpose, base version and branches
+ 
+@@ -27,11 +27,11 @@ two-line hook ending in the comment `// No Payne fork`, so `git grep -n "No Payn
+ | `src/common/libs/Auth/nopayneProjectScope.php` | **New.** The feature: who is restricted, which projects they can reach, the request guard, the list filter, the name redaction. | (whole file) |
+ | `src/common/libs/Auth/instanceActions.php` | Defines the new permission `PROJECTS:VIEW:ONLY_ASSIGNED` (after `PROJECTS:VIEW`). | the `'PROJECTS:VIEW:ONLY_ASSIGNED' => [...]` entry (12 lines) |
+ | `src/common/head.php` | Loads the helper after `$AUTH` is created, so every page and API has it. | `require_once __DIR__ . '/libs/Auth/nopayneProjectScope.php';` |
+-| `src/common/headSecure.php` | Sidebar project list (also used by the dashboard calendar, the parent-project picker and the new-project form) filtered; request guard for every logged-in page. | `nopayneProjectScopeWhere();` in the "get all projects" query; `nopayneProjectScopeRequestGuard();` as the last line |
++| `src/common/headSecure.php` | Sidebar project list (also used by the dashboard calendar, the parent-project picker and the new-project form) filtered, and a sub-project whose parent the user can't reach listed at top level; request guard for every logged-in page. | `nopayneProjectScopeWhere();` in the "get all projects" query; `nopayneProjectScopeTopLevel(...)` in place of `== null` where it picks out top-level projects; `nopayneProjectScopeRequestGuard();` as the last line |
+ | `src/api/apiHeadSecure.php` | Request guard for every logged-in API endpoint (web and mobile app). | `nopayneProjectScopeRequestGuard();` as the last line |
+ | `src/api/file/index.php` | File downloads use `apiHead.php`, not `apiHeadSecure.php`, so they need their own guard (project files, invoices, quotes, delivery notes, payment files). | `nopayneProjectScopeRequestGuard();` after the `require_once` |
+-| `src/api/projects/list.php` | Project list API (mobile app, pickers) filtered, top level and sub-projects. | `nopayneProjectScopeWhere();` ×2 |
+-| `src/project/list.php` | Projects page filtered, top level and sub-projects. | `nopayneProjectScopeWhere();` ×2 |
++| `src/api/projects/list.php` | Project list API (mobile app, pickers) filtered, top level and sub-projects; a sub-project whose parent the user can't reach is listed at top level. | `nopayneProjectScopeWhere();` ×2; `nopayneProjectScopeTopLevelWhere();` in place of `where("projects.projects_parent_project_id IS NULL")` |
++| `src/project/list.php` | Projects page filtered, top level and sub-projects; a sub-project whose parent the user can't reach is listed at top level. | `nopayneProjectScopeWhere();` ×2; `nopayneProjectScopeTopLevelWhere();` in place of `where("projects.projects_parent_project_id IS NULL")` |
+ | `src/api/projects/data.php` | A project's sub-projects (and their assets and money) are only shown if the user can reach them. | `nopayneProjectScopeWhere();` before the sub-project query |
+ | `src/common/libs/Search/SearchProjects.php` | Global search (search page and `/api/search/search.php`). | `nopayneProjectScopeWhere();` |
+ | `src/assets.php` | "Project to assign assets to" dropdown filtered; "Assigned to &lt;project&gt;" on unavailable assets says "another project" instead of naming it. | `nopayneProjectScopeWhere();` in the dropdown query; `nopayneProjectScopeRedact($tag['assignment']);` |
+@@ -41,11 +41,11 @@ two-line hook ending in the comment `// No Payne fork`, so `git grep -n "No Payn
+ | `src/ledger.php` | Payments ledger only lists payments on the user's projects. | `nopayneProjectScopeWhere();` |
+ | `src/user.php` | A user's page lists only the crew roles and managed projects the viewer can reach. | `nopayneProjectScopeWhere();` ×2 |
+ | `src/clients.php` | Client totals only add up the user's projects. | `nopayneProjectScopeWhere();` |
+-| `src/project/crew/vacancies.php` | Crew vacancies only on the user's projects. | `nopayneProjectScopeWhere();` |
++| `src/project/crew/vacancies.php` | Crew vacancies only on the user's projects, and a vacancy on a sub-project doesn't name a parent the user can't reach. | `nopayneProjectScopeWhere();` ×2 |
+ | `src/api/instances/new.php` | A new business's "Administrator" role is created with every permission; this leaves the restriction out. | `array_diff(array_keys($instanceActions), [NOPAYNE_PROJECT_SCOPE_PERMISSION])` |
+ | `e2e/setup/tenants.php` | Same as above for the test businesses' "full access" role, so existing tests keep testing unrestricted users. | `array_diff(array_keys($instanceActions), ["PROJECTS:VIEW:ONLY_ASSIGNED"])` |
+-| `e2e/setup/nopayneProjectScope.php` | **New.** Test data: a restricted user with every other permission, a "client" user with the role No Payne gives clients, and their projects. | (whole file) |
+-| `e2e/authenticated/nopayne-project-scope.spec.ts` | **New.** 70 tests (see section 4). | (whole file) |
++| `e2e/setup/nopayneProjectScope.php` | **New.** Test data: a restricted user with every other permission, a "client" user with the role No Payne gives clients, their projects, and sub-projects (children and grandchildren of their projects, and a parent they aren't on with a child they are crew on). | (whole file) |
++| `e2e/authenticated/nopayne-project-scope.spec.ts` | **New.** 84 tests (see section 4). | (whole file) |
+ | `.github/workflows/e2e-tests.yml` | Run the e2e suite on pull requests into `nopayne` as well as `main`. | `- nopayne` under `pull_request.branches` |
+ | `.github/workflows/nopayne-image.yml` | **New.** Builds and pushes the production image on `nopayne-v*` tags (see section 6). | (whole file) |
+ | `NOPAYNE-FORK.md` | **New.** This file. | (whole file) |
+@@ -59,8 +59,15 @@ No database schema changes and no migrations.
+ - **Who is restricted:** a user whose role (or extra permissions) in the current business includes
+   `PROJECTS:VIEW:ONLY_ASSIGNED`. Server admins with `INSTANCES:FULL_PERMISSIONS_IN_INSTANCE` never are.
+ - **What they can reach:** projects in that business, not deleted, where they are `projects_manager` or have a
+-  non-deleted `crewAssignments` row. There is no other "lead" or "linked user" field on projects. Sub-projects
+-  are not included automatically: the user must be manager or crew on the sub-project itself.
++  non-deleted `crewAssignments` row (there is no other "lead" or "linked user" field on projects), **plus every
++  sub-project of those, to any depth** (`projects_parent_project_id`, following non-deleted sub-projects only).
++  The lookup follows only IDs it hasn't seen, so a cycle of parents (stock doesn't prevent one) can't loop.
++  It only goes down: being on a sub-project doesn't reach its parent or its siblings.
++- **Sub-projects whose parent is out of reach:** the sidebar, the projects page and `api/projects/list.php` nest
++  sub-projects under their parents, one level deep. For a restricted user, a sub-project whose parent they can't
++  reach is listed at top level instead of vanishing (`nopayneProjectScopeTopLevel()` /
++  `nopayneProjectScopeTopLevelWhere()`). As in stock, grandchildren aren't in those nested lists for anyone;
++  they're in search, the business calendar and the flat `api/projects/list.php`, and on their parent's page.
+ - **Request guard:** before any page or API code runs, it collects every project the request refers to and
+   refuses the request (404 page, or `{"result":false,"error":{"code":"AUTH-ERROR"}}` from the API) if one is out
+   of scope. It looks at `$_GET`, `$_POST` and `formData`:
+@@ -91,7 +98,12 @@ and `grep -rln "projects_name\|join(\"projects\"" src`:
+ | `api/projects/`: archive, unArchive, delete, changeClient, changeDeliveryNotes, changeDescription, changeInvoiceNotes, changeName, changeProjectDates, changeProjectDeliverDates, changeProjectFinanceDurationMaths, changeProjectManager, changeProjectType, changeStatus, changeVenue, followParentStatus, getComments, newNote, editNote, newQuickComment | Guard (`projects_id`) |
+ | `api/projects/changeSubProject.php`, `new.php` | Guard (`projects_id`, `projects_parent_project_id`) |
+ | `api/projects/newPayment.php` / `deletePayment.php` | Guard (`projects_id` in formData / `payments_id`) |
+-| `api/projects/data.php` (project page data, comments, files, quotes, invoices, delivery notes, payments) | Guard (`id`, formData `id`); sub-projects filtered |
++| `api/projects/data.php` (project page data, comments, files, quotes, invoices, delivery notes, payments) | Guard (`id`, formData `id`); sub-projects filtered (a no-op since sub-projects of a reachable project are reachable, kept as a safety net) |
++| `api/projects/archive.php`, `unArchive.php`, `delete.php`, `changeStatus.php` (act on the project's sub-projects too) | No change: the sub-projects of a reachable project are reachable |
++| `api/projects/followParentStatus.php` | No change: copies the parent's status ID onto a reachable sub-project, returns nothing about the parent |
++| `api/projects/changeSubProject.php` | Guard on both IDs, so a project can only be moved under a parent the user reaches; `-1` (detach) is allowed on a reachable project, as in stock |
++| `common/headSecure.php` sidebar, `project/list.php`, `api/projects/list.php` (nesting) | A sub-project whose parent is out of reach is listed at top level |
++| `project/crew/vacancies.php` (parent project name) | Parent's name only shown if the user reaches it |
+ | `api/projects/assets/`: assign, setStatusBarcode, setStatusByTag, statusList | Guard (`projects_id`) |
+ | `api/projects/assets/`: setComment, setDiscount, setPrice, unassign | Guard (`assetsAssignments[]`, and `projects_id` when unassigning by asset/type) |
+ | `api/projects/assets/setStatus.php`, `swap.php`, `api/assets/substitutions.php` | Guard (`assetsAssignments_id`) |
+@@ -114,7 +126,8 @@ and `grep -rln "projects_name\|join(\"projects\"" src`:
+ | `api/instances/new.php` | New businesses' Administrator role doesn't get the restriction |
+ | `api/account/calendar-export.php` (personal iCal) | No change: only the user's own crew assignments, which are in scope |
+ | `api/instances/calendar-export.php` (business iCal) | No change to the endpoint: it's keyed by the business's calendar key, which is now hidden from restricted users |
+-| `assets/widgets/statsWidgets.php` | No change: `myCalendar` is the user's own crew roles; the inventory value widgets are business-wide asset totals, not project data (see open question about values) |
++| `assets/widgets/statsWidgets.php` | No change: `myCalendar` is the user's own crew roles; the inventory value widgets are business-wide asset totals, not project data (accepted, see "Decisions" below) |
++| `user.php` (projects the user manages) | Filtered; that list is top-level projects only, so a reachable sub-project whose parent isn't is left out there (it's on the sidebar, projects page and search) |
+ | `public/embed/jobs.php` | No change: public page of vacancies the business chose to publish |
+ | `instances/billing.php`, `projectStatuses.php`, `projectTypes.php` | No change: counts only, behind business-settings permissions |
+ | `server/instances.php`, `server/analytics/tables.php` | No change: server admins only |
+@@ -125,7 +138,7 @@ and `grep -rln "projects_name\|join(\"projects\"" src`:
+ 
+ | Key | Shown as | Effect |
+ |---|---|---|
+-| `PROJECTS:VIEW:ONLY_ASSIGNED` | Projects: View - Only Assigned | **Takes access away.** The user can only see and change projects they manage or are crew on. Needs `PROJECTS:VIEW`. |
++| `PROJECTS:VIEW:ONLY_ASSIGNED` | Projects: View - Only Assigned | **Takes access away.** The user can only see and change projects they manage or are crew on, and those projects' sub-projects. Needs `PROJECTS:VIEW`. |
+ 
+ To set up a client account (e.g. an outside client):
+ 
+@@ -138,10 +151,19 @@ To set up a client account (e.g. an outside client):
+    Don't give it client, ledger, user-list or business-settings permissions unless they need them: those are
+    business-wide, as in stock AdamRMS.
+ 2. **Business settings > Users**: add the user with that role.
+-3. On the client's project, either make them **crew** (Crew tab) or the **project manager**.
++3. On the client's project, either make them **crew** (Crew tab) or the **project manager**. That also gives
++   them every sub-project of it. To give them only a sub-project, put them on the sub-project, not the parent.
+ 
+ Every other role is unchanged. Don't tick the new permission on the Administrator role.
+ 
++### Decisions
++
++- **Sub-projects:** manager or crew on a parent project reaches all its sub-projects, to any depth. Being on a
++  sub-project doesn't give the parent or the sibling sub-projects.
++- **Inventory values:** restricted users still see inventory purchase/replacement values and day/week rates on
++  the assets pages (stock `assets.php` has no permission check for them), and the dashboard's total asset value.
++  Accepted; no "hide purchase value" permission will be built.
++
+ ## 4. Upgrading to a new upstream release
+ 
+ ```bash
+@@ -163,6 +185,9 @@ line back in the same place:
+ - `src/common/headSecure.php` and `src/api/apiHeadSecure.php`: our guard is the **last line**. If upstream adds
+   code at the end, the guard goes after it.
+ - `src/common/head.php`: the `require_once` must stay after `$GLOBALS['AUTH'] = new bID;`.
++- `headSecure.php`, `project/list.php`, `api/projects/list.php`: the top-level test (`== null` /
++  `projects_parent_project_id IS NULL`) is replaced by our helper, not added to. If upstream changes that line,
++  re-apply the replacement.
+ - Project queries (`list.php` ×2, `data.php`, `assets.php`, `calendar.php`, `ledger.php`, `user.php`,
+   `clients.php`, `vacancies.php`, `SearchProjects.php`): `nopayneProjectScopeWhere()` must be called after the
+   query's other `where()`s start and before its `get()`/`paginate()`.
+@@ -173,7 +198,7 @@ line back in the same place:
+ Then check nothing was lost, and audit what upstream added:
+ 
+ ```bash
+-git grep -n "No Payne fork" -- src e2e .github   # 24 hooks in src/ (plus the helper), 1 in e2e/setup/tenants.php, 1 in e2e-tests.yml
++git grep -n "No Payne fork" -- src e2e .github   # 28 hooks in src/ (plus the helper), 1 in e2e/setup/tenants.php, 1 in e2e-tests.yml
+ # New or changed files that take a project ID or list projects need a look (see the audit table in section 2)
+ git diff --name-only vOLD vX.Y.Z -- src | xargs grep -lE "projects_id|join\(\"projects\"|assetsAssignments|crewAssignments|payments_id|projectsVacantRoles|s3files_id" 2>/dev/null
+ ```
+@@ -198,11 +223,14 @@ Merge when green, then tag and deploy (section 6).
+ **Checklist after an upgrade** (on staging, or production right after deploying). Log in as the client user
+ (restricted role, crew on one project) and check:
+ 
+-- [ ] Sidebar, dashboard calendar, **Projects** page, business calendar and search show only their project(s).
+-- [ ] Their project opens and shows its gear with prices.
++- [ ] Sidebar, dashboard calendar, **Projects** page, business calendar and search show only their project(s)
++      and those projects' sub-projects.
++- [ ] Their project opens and shows its gear with prices. A sub-project of it opens too.
++- [ ] Put the client as crew on a sub-project only (of a project they aren't on): the sub-project shows at top
++      level in the sidebar and **Projects** page and opens; its parent's URL gives a 404. Take them off again.
+ - [ ] **Assets** page: the "Project to assign assets to" dropdown lists only their project(s); adding an asset
+       with the basket button works, and removing it works.
+-- [ ] Another project's URL, `/project/?id=<other id>`, gives a 404.
++- [ ] Another project's URL, `/project/?id=<other id>`, gives a 404 (including a sibling of a sub-project they're on).
+ - [ ] The business calendar page shows no iCal subscription URL with a key in it.
+ 
+ And from the browser's developer console while logged in as the client (each must return
+@@ -220,8 +248,9 @@ Finally log in as an admin and check you still see every project.
+ 
+ ## 5. `patches/`
+ 
+-`patches/` holds `git format-patch v1.205.6..<last feature commit> -o patches/`: every commit of ours except the
+-commit that adds `patches/` itself. To re-apply the fork to a fresh checkout of an upstream release:
++`patches/` holds a `git format-patch` export of every commit of ours except the ones that only update
++`patches/` (they're cherry-picked, oldest first, onto a scratch branch from the upstream tag and exported from
++there, as below). To re-apply the fork to a fresh checkout of an upstream release:
+ 
+ ```bash
+ git clone https://github.com/adam-rms/adam-rms.git && cd adam-rms
+diff --git a/e2e/authenticated/nopayne-project-scope.spec.ts b/e2e/authenticated/nopayne-project-scope.spec.ts
+index 7d9a9113..19101d2b 100644
+--- a/e2e/authenticated/nopayne-project-scope.spec.ts
++++ b/e2e/authenticated/nopayne-project-scope.spec.ts
+@@ -3,7 +3,7 @@ import path from "path";
+ import { APP_ENV, BASE_URL, PHP_BINARY } from "../env";
+ import { bookings } from "../projects";
+ import {
+-  test as base, expect, formData, mentions, newSession, seedTenants, snapshot, succeeded,
++  test as base, dbQuery, expect, formData, mentions, newSession, seedTenants, snapshot, succeeded,
+   type Params, type Result, type Session, type Tenant, type Tenants,
+ } from "../tenants";
+ 
+@@ -14,14 +14,21 @@ import {
+  *   - "client": the role No Payne gives a client (view projects, add/remove assets, view crew and asset types)
+  *   - an "own" project both are crew on, and a "managed" project "restricted" manages.
+  * A's seeded project and sub-project (managed by A's full user, no crew from here) are the ones they must not reach.
++ * Sub-projects (managed by A's full user, so access can only come from the parent):
++ *   own > ownChild > ownGrandchild, managed > managedChild > managedGrandchild, and outer > outerChild, outerSibling,
++ *   where both users are crew on outerChild only.
+  * Each refusal has a control: A's full-access user, who isn't restricted, can make the same request.
+  */
+ 
+ type Scope = {
+   users: { restricted: { id: number; email: string }; client: { id: number; email: string } };
+   positions: { restricted: number; client: number };
+-  projects: { own: number; managed: number };
++  projects: {
++    own: number; managed: number; ownChild: number; ownGrandchild: number; managedChild: number; managedGrandchild: number;
++    outer: number; outerChild: number; outerSibling: number;
++  };
+ };
++type Kind = keyof Scope["projects"];
+ 
+ let lastScope: Scope | undefined;
+ /** Passes the IDs from the last call back in, so records are found even if a test changed them, and IDs don't change */
+@@ -76,7 +83,11 @@ test.describe("listing projects", () => {
+       const response = await asRestricted.api("/api/projects/list.php", params);
+       expect(response.json?.result, response.body.slice(0, 500)).toBe(true);
+       const ids = response.json.response.flatMap((p: { projects_id: number; subprojects: { projects_id: number }[] }) => [p.projects_id, ...p.subprojects.map((s) => s.projects_id)]);
+-      expect(ids.sort()).toEqual([scope.projects.own, scope.projects.managed].sort());
++      // Sub-projects of the user's projects are theirs too; nested lists only go one level deep, as in stock
++      const kinds: Kind[] = params.subprojects
++        ? ["own", "managed", "ownChild", "managedChild", "outerChild"]
++        : ["own", "managed", "ownChild", "ownGrandchild", "managedChild", "managedGrandchild", "outerChild"];
++      expect(ids.sort()).toEqual(kinds.map((k) => scope.projects[k]).sort());
+     }
+     // Control: unrestricted users still see every project
+     const all = await asA.api("/api/projects/list.php", {});
+@@ -321,3 +332,136 @@ test.describe("adding and removing assets", () => {
+     }
+   });
+ });
++
++test.describe("sub-projects", () => {
++  // Manager or crew on a project reaches its sub-projects to any depth; being on a sub-project doesn't reach its parent or siblings
++  const reach: Record<"asRestricted" | "asClient", { yes: Kind[]; no: Kind[] }> = {
++    asRestricted: { yes: ["ownChild", "ownGrandchild", "managedChild", "managedGrandchild", "outerChild"], no: ["outer", "outerSibling"] },
++    asClient: { yes: ["ownChild", "ownGrandchild", "outerChild"], no: ["outer", "outerSibling", "managed", "managedChild", "managedGrandchild"] },
++  };
++
++  for (const who of ["asRestricted", "asClient"] as const) {
++    test(`${who}: sub-projects of the user's projects open, page and API, to any depth`, async ({ asRestricted, asClient, scope }) => {
++      const session = who === "asClient" ? asClient : asRestricted;
++      for (const kind of reach[who].yes) {
++        const id = scope.projects[kind];
++        const page = await session.page(`/project/?id=${id}`);
++        expect(page.status, kind).toBe(200);
++        expect(mentions(page, `nopayne ${kind} project`), kind).toBe(true);
++        const data = await session.api("/api/projects/data.php", { id });
++        expect(data.json?.result, `${kind}: ${data.body.slice(0, 500)}`).not.toBe(false);
++        expect(mentions(data, `nopayne ${kind} project description`), kind).toBe(true);
++      }
++    });
++
++    test(`${who}: a parent, sibling or unrelated project stays a 404`, async ({ asRestricted, asClient, asA, tenants: { a }, scope }) => {
++      const session = who === "asClient" ? asClient : asRestricted;
++      for (const kind of reach[who].no) {
++        const id = scope.projects[kind];
++        const page = await session.page(`/project/?id=${id}`);
++        expect(page.status, kind).toBe(404);
++        expect(mentions(page, `nopayne ${kind} project description`), kind).toBe(false);
++        const data = await session.api("/api/projects/data.php", { id });
++        expect(refused(data), `${kind}: ${data.body.slice(0, 500)}`).toBe(true);
++        expect(mentions(await asA.page(`/project/?id=${id}`), `nopayne ${kind} project description`), `control: ${kind}`).toBe(true);
++      }
++      expect((await session.page(`/project/?id=${a.subProjectId}`)).status, "A's seeded sub-project").toBe(404);
++    });
++
++    test(`${who}: lists and search include reachable sub-projects and nothing else`, async ({ asRestricted, asClient, scope }) => {
++      const session = who === "asClient" ? asClient : asRestricted;
++      const search = await session.api("/api/search/search.php", { term: "nopayne", limit: 100 }, "GET");
++      expect(search.json?.result, search.body.slice(0, 500)).toBe(true);
++      for (const kind of reach[who].yes) expect(listsId(search, scope.projects[kind]), `search finds ${kind}`).toBe(true);
++      for (const kind of reach[who].no) expect(listsId(search, scope.projects[kind]), `search doesn't find ${kind}`).toBe(false);
++
++      const list = await session.api("/api/projects/list.php", {});
++      for (const kind of reach[who].yes) expect(listsId(list, scope.projects[kind]), `list has ${kind}`).toBe(true);
++      for (const kind of reach[who].no) expect(listsId(list, scope.projects[kind]), `list doesn't have ${kind}`).toBe(false);
++
++      // The sidebar and projects page nest sub-projects one level deep (as stock does), so grandchildren aren't in them
++      for (const url of ["/", "/project/list.php"]) {
++        const response = await session.page(url);
++        for (const kind of reach[who].yes.filter((k) => !k.endsWith("Grandchild"))) expect(linksTo(response, scope.projects[kind]), `${url} links to ${kind}`).toBe(true);
++        for (const kind of reach[who].no) expect(linksTo(response, scope.projects[kind]), `${url} doesn't link to ${kind}`).toBe(false);
++      }
++    });
++  }
++
++  test("a sub-project whose parent the user can't reach is listed at top level; unrestricted users see it nested", async ({ asRestricted, asLimitedA, scope }) => {
++    type Listed = { projects_id: number; subprojects: { projects_id: number }[] };
++    const restricted: Listed[] = (await asRestricted.api("/api/projects/list.php", { subprojects: "true" })).json.response;
++    expect(restricted.map((p) => Number(p.projects_id))).toContain(scope.projects.outerChild);
++    const full: Listed[] = (await asLimitedA.api("/api/projects/list.php", { subprojects: "true" })).json.response;
++    expect(full.map((p) => Number(p.projects_id)), "unrestricted: not at top level").not.toContain(scope.projects.outerChild);
++    const outer = full.find((p) => Number(p.projects_id) === scope.projects.outer);
++    expect(outer?.subprojects.map((s) => Number(s.projects_id)).sort()).toEqual([scope.projects.outerChild, scope.projects.outerSibling].sort());
++  });
++
++  test("unrestricted users still reach every sub-project", async ({ asLimitedA, scope }) => {
++    const list = await asLimitedA.api("/api/projects/list.php", {});
++    for (const kind of Object.keys(scope.projects) as Kind[]) expect(listsId(list, scope.projects[kind]), kind).toBe(true);
++    for (const kind of ["outer", "outerSibling", "managedGrandchild"] as Kind[]) {
++      expect((await asLimitedA.page(`/project/?id=${scope.projects[kind]}`)).status, kind).toBe(200);
++    }
++  });
++
++  test("crew only on a sub-project can't change its parent or sibling", async ({ asClient, asRestricted, tenants: { a }, scope }) => {
++    try {
++      const before = snapshot(a.instanceId);
++      for (const session of [asClient, asRestricted]) {
++        for (const kind of ["outer", "outerSibling"] as Kind[]) {
++          const response = await session.api("/api/projects/changeDescription.php", { projects_id: scope.projects[kind], projects_description: "Changed by e2e" });
++          expect(refused(response), `${kind}: ${response.body.slice(0, 500)}`).toBe(true);
++        }
++      }
++      expect(snapshot(a.instanceId)).toEqual(before);
++    } finally {
++      reseed();
++    }
++  });
++
++  for (const [who, kind] of [["asClient", "ownChild"], ["asClient", "outerChild"], ["asRestricted", "managedGrandchild"]] as const) {
++    test(`${who} can add an asset to ${kind} and take it off again`, async ({ asClient, asRestricted, tenants: { a }, scope }) => {
++      const session = who === "asClient" ? asClient : asRestricted;
++      const id = scope.projects[kind];
++      try {
++        const added = await session.api("/api/projects/assets/assign.php", { projects_id: id, assets_id: a.spareAssetId });
++        expect(succeeded(added), added.body.slice(0, 500)).toBe(true);
++        expect(bookings(a.spareAssetId)).toEqual([id]);
++        expect(mentions(await session.page(`/project/?id=${id}`), a.spareAssetTag)).toBe(true);
++        const removed = await session.api("/api/projects/assets/unassign.php", { assets_id: a.spareAssetId, projects_id: id });
++        expect(succeeded(removed), removed.body.slice(0, 500)).toBe(true);
++        expect(bookings(a.spareAssetId)).toEqual([]);
++      } finally {
++        reseed();
++      }
++    });
++  }
++
++  test("crew vacancies don't name a parent project out of scope", async ({ asRestricted, asA, tenants: { a }, scope }) => {
++    try {
++      dbQuery("UPDATE projectsVacantRoles SET projects_id = ? WHERE projectsVacantRoles_id = ?", [scope.projects.outerChild, a.vacantRoleId]);
++      const page = await asRestricted.page("/project/crew/vacancies.php");
++      expect(mentions(page, `${a.marker} vacancy`), "the vacancy on outerChild is listed").toBe(true);
++      expect(mentions(page, "nopayne outer project")).toBe(false);
++      expect(mentions(await asA.page("/project/crew/vacancies.php"), "nopayne outer project"), "control").toBe(true);
++    } finally {
++      reseed();
++    }
++  });
++
++  test("a cycle of parent projects doesn't hang the scope lookup", async ({ asRestricted, scope }) => {
++    try {
++      // managed > managedChild > managedGrandchild > managed
++      dbQuery("UPDATE projects SET projects_parent_project_id = ? WHERE projects_id = ?", [scope.projects.managedGrandchild, scope.projects.managed]);
++      expect((await asRestricted.page("/")).status).toBe(200);
++      for (const kind of ["managed", "managedChild", "managedGrandchild"] as Kind[]) {
++        expect((await asRestricted.page(`/project/?id=${scope.projects[kind]}`)).status, kind).toBe(200);
++      }
++      expect((await asRestricted.page(`/project/?id=${scope.projects.outer}`)).status).toBe(404);
++    } finally {
++      reseed();
++    }
++  });
++});
+diff --git a/e2e/setup/nopayneProjectScope.php b/e2e/setup/nopayneProjectScope.php
+index 31fb50a0..dfbfc9c7 100644
+--- a/e2e/setup/nopayneProjectScope.php
++++ b/e2e/setup/nopayneProjectScope.php
+@@ -10,6 +10,11 @@
+ //   - "client": what a client account would be given (the role No Payne asked for), plus the restriction.
+ // Both are crew on the "own" project; "restricted" also manages the "managed" project. Neither is on A's
+ // seeded project or sub-project, which are the ones they must not reach.
++// Sub-projects (all managed by A's full user, so access to them can only come from the parent):
++//   own > ownChild > ownGrandchild           reached through crew on "own"
++//   managed > managedChild > managedGrandchild   reached through managing "managed"
++//   outer > outerChild, outerSibling          both users are crew on outerChild only: they reach it, not
++//                                             "outer" or "outerSibling".
+ $db = new PDO(
+     "mysql:host=" . getenv('DB_HOSTNAME') . ";port=" . (getenv('DB_PORT') ?: 3306) . ";dbname=" . getenv('DB_DATABASE'),
+     getenv('DB_USERNAME'),
+@@ -90,9 +95,13 @@ foreach ($positions as $kind => $position) {
+ $base = one("SELECT * FROM projects WHERE projects_id = ?", [$a['projectId']]);
+ unset($base['projects_id']);
+ $projects = [];
+-foreach (["own" => $a['users']['full']['id'], "managed" => $users['restricted']['id']] as $kind => $manager) {
++$full = $a['users']['full']['id'];
++// kind => [manager, parent kind], parents first
++$tree = ["own" => [$full, null], "managed" => [$users['restricted']['id'], null], "ownChild" => [$full, "own"], "ownGrandchild" => [$full, "ownChild"],
++    "managedChild" => [$full, "managed"], "managedGrandchild" => [$full, "managedChild"], "outer" => [$full, null], "outerChild" => [$full, "outer"], "outerSibling" => [$full, "outer"]];
++foreach ($tree as $kind => [$manager, $parent]) {
+     $values = array_merge($base, ["projects_name" => "nopayne $kind project", "projects_manager" => $manager, "projects_deleted" => 0, "projects_archived" => 0,
+-        "projects_parent_project_id" => null, "projects_dates_deliver_start" => "2032-03-01 09:00:00", "projects_dates_deliver_end" => "2032-03-05 18:00:00",
++        "projects_parent_project_id" => $parent ? $projects[$parent] : null, "projects_status_follow_parent" => 0, "projects_dates_deliver_start" => "2032-03-01 09:00:00", "projects_dates_deliver_end" => "2032-03-05 18:00:00",
+         "projects_dates_use_start" => "2032-03-02 09:00:00", "projects_dates_use_end" => "2032-03-04 18:00:00"]);
+     unset($values['projects_description']);
+     $projects[$kind] = upsert("projects", "projects_id", ["instances_id" => $a['instanceId'], "projects_description" => "nopayne $kind project description"], $values, $previous['projects'][$kind] ?? null);
+@@ -106,14 +115,19 @@ foreach (["own" => $a['users']['full']['id'], "managed" => $users['restricted'][
+     $db->prepare("UPDATE assetsAssignments SET assetsAssignments_deleted = 1 WHERE projects_id = ?")->execute([$projects[$kind]]);
+ }
+ // Projects tests created that these users manage (e.g. a sub-project made by new.php) would let them see more
+-$db->prepare("UPDATE projects SET projects_deleted = 1 WHERE instances_id = ? AND projects_manager IN (?, ?) AND projects_id NOT IN (?, ?)")
+-    ->execute([$a['instanceId'], $users['restricted']['id'], $users['client']['id'], $projects['own'], $projects['managed']]);
+-// Crew: both users on "own"; no-one from these tests on anything else
++$db->prepare("UPDATE projects SET projects_deleted = 1 WHERE instances_id = ? AND projects_manager IN (?, ?) AND projects_id NOT IN (" . implode(",", array_fill(0, count($projects), "?")) . ")")
++    ->execute([$a['instanceId'], $users['restricted']['id'], $users['client']['id'], ...array_values($projects)]);
++// ...and so would sub-projects tests made under them
++$db->prepare("UPDATE projects SET projects_deleted = 1 WHERE instances_id = ? AND projects_parent_project_id IN (" . implode(",", array_fill(0, count($projects), "?")) . ") AND projects_id NOT IN (" . implode(",", array_fill(0, count($projects), "?")) . ")")
++    ->execute([$a['instanceId'], ...array_values($projects), ...array_values($projects)]);
++// Crew: both users on "own" and "outerChild"; no-one from these tests on anything else
+ foreach ($users as $kind => $user) {
+-    $db->prepare("UPDATE crewAssignments SET crewAssignments_deleted = 1 WHERE users_userid = ? AND projects_id != ?")->execute([$user['id'], $projects['own']]);
+-    upsert("crewAssignments", "crewAssignments_id", ["projects_id" => $projects['own'], "users_userid" => $user['id']], [
+-        "crewAssignments_role" => "nopayne $kind crew", "crewAssignments_comment" => null, "crewAssignments_deleted" => 0, "crewAssignments_personName" => null, "crewAssignments_rank" => 1,
+-    ]);
++    $db->prepare("UPDATE crewAssignments SET crewAssignments_deleted = 1 WHERE users_userid = ? AND projects_id NOT IN (?, ?)")->execute([$user['id'], $projects['own'], $projects['outerChild']]);
++    foreach (["own", "outerChild"] as $project) {
++        upsert("crewAssignments", "crewAssignments_id", ["projects_id" => $projects[$project], "users_userid" => $user['id']], [
++            "crewAssignments_role" => "nopayne $kind crew", "crewAssignments_comment" => null, "crewAssignments_deleted" => 0, "crewAssignments_personName" => null, "crewAssignments_rank" => 1,
++        ]);
++    }
+ }
+ 
+ echo json_encode(["users" => $users, "positions" => $positions, "projects" => $projects], JSON_PRETTY_PRINT) . "\n";
+diff --git a/src/api/projects/list.php b/src/api/projects/list.php
+index 268e3d71..02af9c29 100644
+--- a/src/api/projects/list.php
++++ b/src/api/projects/list.php
+@@ -14,7 +14,7 @@ $DBLIB->orderBy("projects.projects_name", "ASC");
+ $DBLIB->orderBy("projects.projects_created", "ASC");
+ 
+ if (isset($_POST['subprojects'])) {
+-    $DBLIB->where("projects.projects_parent_project_id IS NULL");
++    nopayneProjectScopeTopLevelWhere(); // No Payne fork: was $DBLIB->where("projects.projects_parent_project_id IS NULL");
+ }
+ 
+ $projects = $DBLIB->get("projects", null, ["projects.projects_id", "projects.projects_name", "clients.clients_name", "projects.projects_manager"]);
+diff --git a/src/common/headSecure.php b/src/common/headSecure.php
+index 9f80f47a..3953cc97 100644
+--- a/src/common/headSecure.php
++++ b/src/common/headSecure.php
+@@ -82,7 +82,7 @@ if ($CONFIG['LINKS_TERMSOFSERVICEURL'] and ($PAGEDATA['USERDATA']['users_termsAc
+     $PAGEDATA['projects'] = [];
+     $tempProjectKeys = []; //Track the Project IDs of all projects and their place in the array (allows us to preserve sorting)
+     foreach ($projects as $index => $project) {
+-        if ($project['projects_parent_project_id'] == null) {
++        if (nopayneProjectScopeTopLevel($project['projects_parent_project_id'])) { // No Payne fork: was == null
+             $project['subProjects'] = [];
+             $tempProjectKeys[$project['projects_id']] = count($PAGEDATA['projects']);
+             $PAGEDATA['projects'][] = $project;
+diff --git a/src/common/libs/Auth/nopayneProjectScope.php b/src/common/libs/Auth/nopayneProjectScope.php
+index a614fda3..94831e15 100644
+--- a/src/common/libs/Auth/nopayneProjectScope.php
++++ b/src/common/libs/Auth/nopayneProjectScope.php
+@@ -3,8 +3,9 @@
+  * No Payne fork: per-project access control. See NOPAYNE-FORK.md at the repo root.
+  *
+  * A user whose role in a business has PROJECTS:VIEW:ONLY_ASSIGNED ("restricted") can only see and touch the
+- * projects in that business they manage (projects_manager) or are crew on (crewAssignments). Everyone else,
+- * including server admins with INSTANCES:FULL_PERMISSIONS_IN_INSTANCE, is unaffected.
++ * projects in that business they manage (projects_manager) or are crew on (crewAssignments), and every
++ * sub-project of those (to any depth). Everyone else, including server admins with
++ * INSTANCES:FULL_PERMISSIONS_IN_INSTANCE, is unaffected.
+  *
+  * All the logic lives here so upstream merges only meet one-line hooks:
+  *   - nopayneProjectScopeRequestGuard() runs at the end of headSecure.php / apiHeadSecure.php (and in
+@@ -12,6 +13,8 @@
+  *     a child record (assetsAssignments_id, payments_id, s3files_id, ...) - and refuses the request if one of
+  *     them is out of scope.
+  *   - nopayneProjectScopeWhere() is called before each query that lists projects, to limit it to the user's.
++ *   - nopayneProjectScopeTopLevel() / nopayneProjectScopeTopLevelWhere() list a sub-project whose parent is out
++ *     of scope at top level, where stock nests sub-projects under their parents.
+  *   - nopayneProjectScopeRedact() blanks the names of other projects in rows that only mention them in passing
+  *     (an asset's "assigned to X", a crew clash warning).
+  *
+@@ -99,7 +102,7 @@ function nopayneProjectScopeQuery(string $sql, array $params): array
+     return $values;
+ }
+ 
+-/** IDs of the projects in a business the user manages or is crew on */
++/** IDs of the projects in a business the user manages or is crew on, and all their sub-projects (to any depth) */
+ function nopayneProjectScopeIds($instanceId = null): array
+ {
+     global $AUTH;
+@@ -112,6 +115,16 @@ function nopayneProjectScopeIds($instanceId = null): array
+                 OR projects_id IN (SELECT projects_id FROM crewAssignments WHERE users_userid = ? AND crewAssignments_deleted = 0))",
+             [$instanceId, $userId, $userId]
+         ));
++        // Add sub-projects a level at a time. Only IDs not seen before are followed, so a cycle of parents ends.
++        $level = $cache[$instanceId];
++        while ($level) {
++            $children = array_map("intval", nopayneProjectScopeQuery(
++                "SELECT projects_id FROM projects WHERE instances_id = ? AND projects_deleted = 0 AND projects_parent_project_id IN (" . implode(",", $level) . ")",
++                [$instanceId]
++            ));
++            $level = array_values(array_diff($children, $cache[$instanceId]));
++            $cache[$instanceId] = array_merge($cache[$instanceId], $level);
++        }
+     }
+     return $cache[$instanceId];
+ }
+@@ -132,6 +145,26 @@ function nopayneProjectScopeWhere(string $column = "projects.projects_id"): void
+     $DBLIB->where($column, nopayneProjectScopeIds() ?: [0], "IN"); // [0] matches nothing; an empty IN () is a syntax error
+ }
+ 
++/**
++ * Whether a project should be listed as top level: it has no parent, or (for a restricted user) its parent is
++ * out of their scope, so the sub-project they can reach doesn't vanish from lists that nest sub-projects under
++ * their parents. As the scope includes every sub-project of a project in it, a parent out of scope means the
++ * user reached this project directly.
++ */
++function nopayneProjectScopeTopLevel($parentId): bool
++{
++    if ($parentId === null) return true;
++    return nopayneProjectScopeRestricted() and !in_array((int) $parentId, nopayneProjectScopeIds(), true);
++}
++
++/** In place of stock's where("projects_parent_project_id IS NULL"): top-level projects, as nopayneProjectScopeTopLevel() defines them */
++function nopayneProjectScopeTopLevelWhere(string $column = "projects.projects_parent_project_id"): void
++{
++    global $DBLIB;
++    if (!nopayneProjectScopeRestricted()) $DBLIB->where("$column IS NULL");
++    else $DBLIB->where("($column IS NULL OR $column NOT IN (" . implode(",", nopayneProjectScopeIds() ?: [0]) . "))");
++}
++
+ /** Replaces the names of projects out of the user's scope in rows (each with projects_id and projects_name) */
+ function nopayneProjectScopeRedact(&$rows): void
+ {
+diff --git a/src/project/crew/vacancies.php b/src/project/crew/vacancies.php
+index 229970f1..74585d12 100644
+--- a/src/project/crew/vacancies.php
++++ b/src/project/crew/vacancies.php
+@@ -35,6 +35,7 @@ foreach($roles as $role) {
+     //get parent project if set
+     if ($role['projects_parent_project_id']) {
+         $DBLIB->where("projects_id",$role['projects_parent_project_id']);
++        nopayneProjectScopeWhere("projects_id"); // No Payne fork: don't name a parent project out of scope
+         $DBLIB->where("projects_deleted",0);
+         $DBLIB->where("projects_archived",0);
+         $role['parentProject'] = $DBLIB->getOne("projects",["projects_id","projects_name"]);
+diff --git a/src/project/list.php b/src/project/list.php
+index f834f8a8..1d86c28a 100644
+--- a/src/project/list.php
++++ b/src/project/list.php
+@@ -40,7 +40,7 @@ $DBLIB->pageLimit = (isset($_GET['pageLimit']) ? $_GET['pageLimit'] : 30);
+ $DBLIB->where("projects.instances_id", $AUTH->data['instance']['instances_id']);
+ nopayneProjectScopeWhere(); // No Payne fork: per-project access control
+ $DBLIB->where("projects.projects_deleted", 0);
+-$DBLIB->where("projects.projects_parent_project_id IS NULL");
++nopayneProjectScopeTopLevelWhere(); // No Payne fork: was $DBLIB->where("projects.projects_parent_project_id IS NULL");
+ if (strlen($PAGEDATA['search']) > 0) {
+     //Search
+     $DBLIB->where("(
+-- 
+2.47.3
+

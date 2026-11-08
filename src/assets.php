@@ -228,6 +228,7 @@ foreach ($assets as $asset) {
                 $DBLIB->where("(projectsStatuses.projectsStatuses_assetsReleased = 0 OR projects.projects_id = '" . $RETURN['PROJECT']['ID'] . "')");
             } else $DBLIB->where("projectsStatuses.projectsStatuses_assetsReleased", 0);
             $tag['assignment'] = $DBLIB->get("assetsAssignments", null, ["assetsAssignments.assetsAssignments_id", "assetsAssignments.projects_id", "projects.projects_name"]);
+            nopayneProjectScopeRedact($tag['assignment']); // No Payne fork: per-project access control
         }
         $tag['flagsblocks'] = assetFlagsAndBlocks($tag['assets_id']);
         if ($tag['assignment'] or $tag['flagsblocks']['COUNT']['BLOCK'] > 0) $asset['countBlocked']++;
@@ -243,6 +244,7 @@ $PAGEDATA['searchOptions'] = [];
 
 // Projects for search
 $DBLIB->where("projects.instances_id", $AUTH->data['instance']['instances_id']);
+nopayneProjectScopeWhere(); // No Payne fork: per-project access control
 $DBLIB->where("projects.projects_deleted", 0);
 $DBLIB->where("projects.projects_archived", 0);
 $DBLIB->where("projects.projects_dates_deliver_start",NULL,"IS NOT");

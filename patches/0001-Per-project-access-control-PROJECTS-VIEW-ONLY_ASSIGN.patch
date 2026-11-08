@@ -1,0 +1,997 @@
+From 2978f6fce9b95d8c350315df2e5748fbc5c94f5e Mon Sep 17 00:00:00 2001
+From: jopdop30 <jopdop30@users.noreply.github.com>
+Date: Sun, 8 Nov 2026 10:39:38 +0000
+Subject: [PATCH 1/5] Per-project access control: PROJECTS:VIEW:ONLY_ASSIGNED
+
+No Payne fork. A user whose role has the new instance permission
+PROJECTS:VIEW:ONLY_ASSIGNED can only see and change projects they manage or
+are crew on. Everyone else, including server admins, is unaffected.
+
+All logic is in src/common/libs/Auth/nopayneProjectScope.php:
+- a request guard, run at the end of headSecure.php and apiHeadSecure.php
+  (and in api/file/index.php), refuses any request naming an out-of-scope
+  project directly or through a child record (assignments, payments, crew,
+  notes, vacancies, applications, project files)
+- nopayneProjectScopeWhere() hooks limit every project listing (sidebar,
+  project list page and API, search, assets page dropdown, calendar,
+  ledger, user page, clients totals, vacancies, sub-projects)
+- nopayneProjectScopeRedact() hides other projects' names where an asset or
+  crew member's other bookings are shown
+
+New businesses' Administrator role, and the e2e "full access" role, don't
+get the restriction. No schema changes.
+
+E2E: authenticated/nopayne-project-scope.spec.ts (with setup/nopayneProjectScope.php).
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ .../nopayne-project-scope.spec.ts             | 308 ++++++++++++++++++
+ e2e/setup/nopayneProjectScope.php             | 119 +++++++
+ e2e/setup/tenants.php                         |   2 +-
+ src/api/apiHeadSecure.php                     |   3 +-
+ src/api/file/index.php                        |   1 +
+ src/api/instances/new.php                     |   2 +-
+ src/api/projects/crew/assign.php              |   1 +
+ src/api/projects/data.php                     |   1 +
+ src/api/projects/list.php                     |   2 +
+ src/asset.php                                 |   1 +
+ src/assets.php                                |   2 +
+ src/clients.php                               |   1 +
+ src/common/head.php                           |   1 +
+ src/common/headSecure.php                     |   2 +
+ src/common/libs/Auth/instanceActions.php      |  12 +
+ src/common/libs/Auth/nopayneProjectScope.php  | 220 +++++++++++++
+ src/common/libs/Search/SearchProjects.php     |   1 +
+ src/instances/calendar.php                    |   2 +
+ src/ledger.php                                |   1 +
+ src/project/crew/vacancies.php                |   1 +
+ src/project/list.php                          |   2 +
+ src/user.php                                  |   2 +
+ 22 files changed, 684 insertions(+), 3 deletions(-)
+ create mode 100644 e2e/authenticated/nopayne-project-scope.spec.ts
+ create mode 100644 e2e/setup/nopayneProjectScope.php
+ create mode 100644 src/common/libs/Auth/nopayneProjectScope.php
+
+diff --git a/e2e/authenticated/nopayne-project-scope.spec.ts b/e2e/authenticated/nopayne-project-scope.spec.ts
+new file mode 100644
+index 00000000..fa5ff70e
+--- /dev/null
++++ b/e2e/authenticated/nopayne-project-scope.spec.ts
+@@ -0,0 +1,308 @@
++import { execFileSync } from "child_process";
++import path from "path";
++import { APP_ENV, BASE_URL, PHP_BINARY } from "../env";
++import { bookings } from "../projects";
++import {
++  test as base, expect, formData, mentions, newSession, seedTenants, snapshot, succeeded,
++  type Params, type Result, type Session, type Tenant, type Tenants,
++} from "../tenants";
++
++/**
++ * No Payne fork (see NOPAYNE-FORK.md): PROJECTS:VIEW:ONLY_ASSIGNED limits a user to the projects they manage
++ * or are crew on. setup/nopayneProjectScope.php adds to business A:
++ *   - "restricted": every permission A has, plus the restriction, so a refusal can only be down to the restriction
++ *   - "client": the role No Payne gives a client (view projects, add/remove assets, view crew and asset types)
++ *   - an "own" project both are crew on, and a "managed" project "restricted" manages.
++ * A's seeded project and sub-project (managed by A's full user, no crew from here) are the ones they must not reach.
++ * Each refusal has a control: A's full-access user, who isn't restricted, can make the same request.
++ */
++
++type Scope = {
++  users: { restricted: { id: number; email: string }; client: { id: number; email: string } };
++  positions: { restricted: number; client: number };
++  projects: { own: number; managed: number };
++};
++
++let lastScope: Scope | undefined;
++/** Passes the IDs from the last call back in, so records are found even if a test changed them, and IDs don't change */
++function seedScope(tenants: Tenants): Scope {
++  const args = [path.join(__dirname, "..", "setup", "nopayneProjectScope.php"), JSON.stringify(tenants), ...(lastScope ? [JSON.stringify(lastScope)] : [])];
++  const out = execFileSync(PHP_BINARY, args, {
++    cwd: path.resolve(__dirname, "..", ".."),
++    env: { ...process.env, ...APP_ENV },
++    encoding: "utf8",
++  });
++  lastScope = JSON.parse(out);
++  return lastScope!;
++}
++
++/** Puts A, B and this spec's records back how the setup scripts define them */
++function reseed(): { tenants: Tenants; scope: Scope } {
++  const tenants = seedTenants();
++  return { tenants, scope: seedScope(tenants) };
++}
++
++const test = base.extend<{ scope: Scope }, { scopeSeeded: Scope; asRestricted: Session; asClient: Session }>({
++  scopeSeeded: [async ({ seeded }, use) => use(seedScope(seeded)), { scope: "worker" }],
++  scope: async ({ scopeSeeded }, use) => use(scopeSeeded),
++  asRestricted: [
++    async ({ playwright, scopeSeeded, seeded }, use) => {
++      const request = await playwright.request.newContext({ baseURL: BASE_URL });
++      await use(await newSession(request, scopeSeeded.users.restricted.email, seeded.password));
++      await request.dispose();
++    },
++    { scope: "worker" },
++  ],
++  asClient: [
++    async ({ playwright, scopeSeeded, seeded }, use) => {
++      const request = await playwright.request.newContext({ baseURL: BASE_URL });
++      await use(await newSession(request, scopeSeeded.users.client.email, seeded.password));
++      await request.dispose();
++    },
++    { scope: "worker" },
++  ],
++});
++
++/** A link to the project, as the sidebar, lists, calendars and search results print them */
++const linksTo = (r: Result, id: number) => new RegExp(`/project/\\?id=${id}(?!\\d)`).test(r.body);
++/** The project's ID as a JSON field */
++const listsId = (r: Result, id: number) => new RegExp(`"projects_id":"?${id}(?!\\d)`).test(r.body);
++/** How the scope check refuses an API call */
++const refused = (r: Result) => r.json?.result === false && r.json?.error?.code === "AUTH-ERROR";
++
++test.describe("listing projects", () => {
++  test("api/projects/list.php lists only the user's projects", async ({ asRestricted, asA, tenants: { a }, scope }) => {
++    for (const params of [{}, { subprojects: "true" }] as Params[]) {
++      const response = await asRestricted.api("/api/projects/list.php", params);
++      expect(response.json?.result, response.body.slice(0, 500)).toBe(true);
++      const ids = response.json.response.flatMap((p: { projects_id: number; subprojects: { projects_id: number }[] }) => [p.projects_id, ...p.subprojects.map((s) => s.projects_id)]);
++      expect(ids.sort()).toEqual([scope.projects.own, scope.projects.managed].sort());
++    }
++    // Control: unrestricted users still see every project
++    const all = await asA.api("/api/projects/list.php", {});
++    for (const id of [a.projectId, scope.projects.own, scope.projects.managed]) expect(listsId(all, id), `full user sees ${id}`).toBe(true);
++  });
++
++  test("a user with PROJECTS:VIEW and no restriction still sees every project", async ({ asLimitedA, tenants: { a }, scope }) => {
++    const all = await asLimitedA.api("/api/projects/list.php", {});
++    for (const id of [a.projectId, scope.projects.own, scope.projects.managed]) expect(listsId(all, id), `limited user sees ${id}`).toBe(true);
++    expect(mentions(await asLimitedA.page(`/project/?id=${a.projectId}`), `${a.marker} project description`)).toBe(true);
++  });
++
++  const pages = [
++    { name: "the sidebar and dashboard calendar", url: () => "/" },
++    { name: "project/list.php", url: () => "/project/list.php" },
++    { name: "the business calendar", url: () => "/instances/calendar.php" },
++    { name: "search.php", url: (a: Tenant) => `/search.php?term=${a.marker}` },
++    { name: "the user page of the other project's manager", url: (a: Tenant) => `/user.php?id=${a.users.full.id}` },
++  ];
++  for (const p of pages) {
++    test(`${p.name} links only to the user's projects`, async ({ asRestricted, asA, tenants: { a }, scope }) => {
++      const response = await asRestricted.page(p.url(a));
++      expect(response.status).toBe(200);
++      expect(linksTo(response, a.projectId), "links to A's seeded project").toBe(false);
++      expect(linksTo(response, a.subProjectId), "links to A's seeded sub-project").toBe(false);
++      expect(linksTo(await asA.page(p.url(a)), a.projectId), "control: the full user's page links to it").toBe(true);
++    });
++  }
++
++  test("the sidebar lists the user's own projects", async ({ asRestricted, scope }) => {
++    const response = await asRestricted.page("/");
++    expect(linksTo(response, scope.projects.own)).toBe(true);
++    expect(linksTo(response, scope.projects.managed)).toBe(true);
++  });
++
++  test("global search finds only the user's projects", async ({ asRestricted, asA, tenants: { a }, scope }) => {
++    const search = (s: Session) => s.api("/api/search/search.php", { term: a.marker }, "GET");
++    const response = await search(asRestricted);
++    expect(response.json?.result, response.body.slice(0, 500)).toBe(true);
++    expect(listsId(response, a.projectId)).toBe(false);
++    expect(listsId(response, scope.projects.own), "finds its own project by client name").toBe(true);
++    expect(listsId(await search(asA), a.projectId), "control").toBe(true);
++  });
++
++  test("the assets page offers only the user's projects to assign to", async ({ asRestricted, asClient, asA, tenants: { a }, scope }) => {
++    const option = (id: number) => new RegExp(`value="${id}">[^<]*\\| ${a.marker} client`);
++    for (const session of [asRestricted, asClient]) {
++      const response = await session.page("/assets.php");
++      expect(option(a.projectId).test(response.body)).toBe(false);
++      expect(option(scope.projects.own).test(response.body)).toBe(true);
++    }
++    expect(option(a.projectId).test((await asA.page("/assets.php")).body), "control").toBe(true);
++  });
++
++  test("an asset's bookings on other projects don't give their names", async ({ asRestricted, asA, tenants: { a } }) => {
++    const name = `${a.marker} project',`; // the end of the calendar entry's title
++    expect(mentions(await asRestricted.page(`/asset.php?id=${a.assetTypeId}`), name)).toBe(false);
++    expect(mentions(await asA.page(`/asset.php?id=${a.assetTypeId}`), name), "control").toBe(true);
++  });
++
++  test("the payments ledger and crew vacancies leave out other projects", async ({ asRestricted, asA, tenants: { a } }) => {
++    for (const [url, text] of [["/ledger.php", `${a.marker} payment`], ["/project/crew/vacancies.php", `${a.marker} vacancy`]]) {
++      expect(mentions(await asRestricted.page(url), text), url).toBe(false);
++      expect(mentions(await asA.page(url), text), `control: ${url}`).toBe(true);
++    }
++  });
++
++  test("the business calendar doesn't hand out the business-wide iCal feed", async ({ asRestricted, asA, tenants: { a } }) => {
++    const feed = `key=e2e-calendar-hash-a`;
++    expect(mentions(await asRestricted.page("/instances/calendar.php"), feed)).toBe(false);
++    expect(mentions(await asA.page("/instances/calendar.php"), feed), "control").toBe(true);
++  });
++});
++
++test.describe("opening a project", () => {
++  test("the user's own projects open, as crew or as manager", async ({ asRestricted, asClient, scope }) => {
++    for (const [session, id] of [[asRestricted, scope.projects.own], [asRestricted, scope.projects.managed], [asClient, scope.projects.own]] as const) {
++      const page = await session.page(`/project/?id=${id}`);
++      expect(page.status).toBe(200);
++      expect(mentions(page, "nopayne"), `project ${id}`).toBe(true);
++      const data = await session.api("/api/projects/data.php", { id });
++      expect(data.json?.result, data.body.slice(0, 500)).not.toBe(false);
++    }
++  });
++
++  const pages: { name: string; url: (a: Tenant) => string; shows: (a: Tenant) => string }[] = [
++    { name: "project/index.php", url: (a: Tenant) => `/project/?id=${a.projectId}`, shows: (a: Tenant) => `${a.marker} project description` },
++    { name: "project/index.php (sub-project)", url: (a: Tenant) => `/project/?id=${a.subProjectId}`, shows: (a: Tenant) => `${a.marker} sub-project` },
++    { name: "project/projectInvoice.php", url: (a: Tenant) => `/project/projectInvoice.php?id=${a.projectId}`, shows: (a: Tenant) => `${a.marker}\\u0020project` },
++    { name: "project/noteExport.php", url: (a: Tenant) => `/project/noteExport.php?id=${a.noteId}`, shows: (a: Tenant) => `${a.marker} note` },
++    { name: "project/crew/vacantCrew.php", url: (a: Tenant) => `/project/crew/vacantCrew.php?id=${a.projectId}`, shows: (a: Tenant) => `${a.marker} vacancy` },
++    { name: "project/crew/vacancy.php", url: (a: Tenant) => `/project/crew/vacancy.php?id=${a.vacantRoleId}`, shows: (a: Tenant) => `${a.marker} vacancy` },
++    { name: "project/crew/applications.php", url: (a: Tenant) => `/project/crew/applications.php?id=${a.vacantRoleId}`, shows: (a: Tenant) => `${a.marker} application` },
++    { name: "assets.php?project=", url: (a: Tenant) => `/assets.php?project=${a.projectId}`, shows: (a: Tenant) => `${a.marker} project | ${a.marker} client` },
++  ];
++  for (const p of pages) {
++    test(`page ${p.name} is a 404 for another project's record`, async ({ asRestricted, asA, tenants: { a } }) => {
++      const response = await asRestricted.page(p.url(a));
++      expect(response.status).toBe(404);
++      expect(mentions(response, p.shows(a))).toBe(false);
++      expect(mentions(await asA.page(p.url(a)), p.shows(a)), "control: the full user sees it").toBe(true);
++    });
++  }
++
++  const reads: { label: string; endpoint: string; params: (a: Tenant) => Params; shows: (a: Tenant) => string; method?: "GET" }[] = [
++    { label: "id", endpoint: "/api/projects/data.php", params: (a) => ({ id: a.projectId }), shows: (a) => `${a.marker} project description` },
++    { label: "formData id", endpoint: "/api/projects/data.php", params: (a) => ({ formData: formData({ id: a.projectId }) }), shows: (a) => `${a.marker} project description` },
++    { label: "projects_id", endpoint: "/api/projects/assets/statusList.php", params: (a) => ({ projects_id: a.projectId }), shows: (a) => `${a.marker} assignment comment` },
++    { label: "projects_id", endpoint: "/api/projects/getComments.php", params: (a) => ({ projects_id: a.projectId }), shows: (a) => `${a.marker} quick comment` },
++    { label: "projects_id", endpoint: "/api/projects/crew/crewRoles/list.php", params: (a) => ({ projects_id: a.projectId }), shows: (a) => `${a.marker} vacancy` },
++    { label: "projectsVacantRoles_id", endpoint: "/api/projects/crew/crewRoles/applicationList.php", params: (a) => ({ projectsVacantRoles_id: a.vacantRoleId }), shows: (a) => `${a.marker} application` },
++    { label: "assetsAssignments_id", endpoint: "/api/assets/substitutions.php", params: (a) => ({ assetsAssignments_id: a.assignmentId }), shows: (a) => a.spareAssetTag },
++    { label: "GET with instances_id, as the app sends it", endpoint: "/api/projects/data.php", params: (a) => ({ id: a.projectId, instances_id: a.instanceId }), shows: (a) => `${a.marker} project description`, method: "GET" },
++  ];
++  for (const r of reads) {
++    test(`${r.endpoint} (${r.label}) refuses another project's record`, async ({ asRestricted, asA, tenants: { a } }) => {
++      const response = await asRestricted.api(r.endpoint, r.params(a), r.method);
++      expect(refused(response), response.body.slice(0, 500)).toBe(true);
++      expect(mentions(response, r.shows(a))).toBe(false);
++      expect(mentions(await asA.api(r.endpoint, r.params(a), r.method), r.shows(a)), "control: the full user gets it").toBe(true);
++    });
++  }
++});
++
++type WriteCase = { endpoint: string; params: (a: Tenant, scope: Scope) => Params };
++// The same requests tenant-isolation.spec.ts makes, aimed at A's seeded project and its records
++const writes: WriteCase[] = [
++  { endpoint: "/api/projects/changeName.php", params: (a) => ({ projects_id: a.projectId, projects_name: "Renamed by e2e" }) },
++  { endpoint: "/api/projects/changeDescription.php", params: (a) => ({ projects_id: a.projectId, projects_description: "Changed by e2e" }) },
++  { endpoint: "/api/projects/changeDeliveryNotes.php", params: (a) => ({ projects_id: a.projectId, projects_deliveryNotes: "Changed by e2e" }) },
++  { endpoint: "/api/projects/changeInvoiceNotes.php", params: (a) => ({ projects_id: a.projectId, projects_invoiceNotes: "Changed by e2e" }) },
++  { endpoint: "/api/projects/changeProjectDates.php", params: (a) => ({ projects_id: a.projectId, projects_dates_use_start: "2031-01-01 09:00", projects_dates_use_end: "2031-01-02 09:00" }) },
++  { endpoint: "/api/projects/changeProjectDeliverDates.php", params: (a) => ({ projects_id: a.projectId, projects_dates_deliver_start: "2031-01-01 09:00", projects_dates_deliver_end: "2031-01-05 09:00" }) },
++  { endpoint: "/api/projects/changeProjectFinanceDurationMaths.php", params: (a) => ({ projects_id: a.projectId, projects_dates_finances_days: 3, projects_dates_finances_weeks: 1 }) },
++  { endpoint: "/api/projects/archive.php", params: (a) => ({ projects_id: a.projectId }) },
++  { endpoint: "/api/projects/delete.php", params: (a) => ({ projects_id: a.projectId }) },
++  { endpoint: "/api/projects/changeStatus.php", params: (a) => ({ projects_id: a.projectId, projectsStatuses_id: a.projectStatusIds.second }) },
++  { endpoint: "/api/projects/changeProjectManager.php", params: (a, s) => ({ projects_id: a.projectId, users_userid: s.users.restricted.id }) },
++  { endpoint: "/api/projects/changeSubProject.php", params: (a) => ({ projects_id: a.subProjectId, projects_parent_project_id: -1 }) },
++  // Moving the user's own project under someone else's
++  { endpoint: "/api/projects/changeSubProject.php", params: (a, s) => ({ projects_id: s.projects.managed, projects_parent_project_id: a.projectId }) },
++  { endpoint: "/api/projects/followParentStatus.php", params: (a) => ({ projects_id: a.subProjectId, follow: "true" }) },
++  { endpoint: "/api/projects/new.php", params: (a, s) => ({ projects_name: "Sub-project by e2e", projectsType_id: a.projectTypeId, projects_manager: s.users.restricted.id, projects_parent_project_id: a.projectId }) },
++  { endpoint: "/api/projects/newNote.php", params: (a) => ({ projects_id: a.projectId, projectsNotes_title: "Note by e2e" }) },
++  { endpoint: "/api/projects/editNote.php", params: (a) => ({ projects_id: a.projectId, projectsNotes_id: a.noteId, projectsNotes_text: "Changed by e2e" }) },
++  { endpoint: "/api/projects/newPayment.php", params: (a) => ({ formData: formData({ projects_id: a.projectId, payments_amount: "1.00", payments_type: 1, payments_date: "2024-02-01" }) }) },
++  { endpoint: "/api/projects/deletePayment.php", params: (a) => ({ payments_id: a.paymentId }) },
++  { endpoint: "/api/projects/newQuickComment.php", params: (a) => ({ projects_id: a.projectId, text: "Comment by e2e" }) },
++  { endpoint: "/api/projects/assets/assign.php", params: (a) => ({ projects_id: a.projectId, assets_id: a.spareAssetId }) },
++  { endpoint: "/api/projects/assets/unassign.php", params: (a) => ({ assetsAssignments: [a.assignmentId] }) },
++  { endpoint: "/api/projects/assets/swap.php", params: (a) => ({ assetsAssignments_id: a.assignmentId, assets_id: a.spareAssetId }) },
++  { endpoint: "/api/projects/assets/setComment.php", params: (a) => ({ assetsAssignments: [a.assignmentId], assetsAssignments_comment: "Changed by e2e" }) },
++  { endpoint: "/api/projects/assets/setDiscount.php", params: (a) => ({ assetsAssignments: [a.assignmentId], assetsAssignments_discount: 10 }) },
++  { endpoint: "/api/projects/assets/setPrice.php", params: (a) => ({ assetsAssignments: [a.assignmentId], assetsAssignments_customPrice: "5.00" }) },
++  { endpoint: "/api/projects/assets/setStatus.php", params: (a) => ({ assetsAssignments_id: a.assignmentId, assetsAssignments_status: a.assignmentStatusId }) },
++  { endpoint: "/api/projects/assets/setStatusByTag.php", params: (a) => ({ projects_id: a.projectId, text: a.assetTag, assetsAssignments_status: a.assignmentStatusId }) },
++  { endpoint: "/api/projects/assets/setStatusBarcode.php", params: (a) => ({ projects_id: a.projectId, text: a.barcodeValue, type: "CODE_128", assetsAssignments_status: a.assignmentStatusId }) },
++  { endpoint: "/api/projects/crew/edit.php", params: (a) => ({ crewAssignments_id: a.crewAssignmentId, crewAssignments_comment: "Changed by e2e" }) },
++  { endpoint: "/api/projects/crew/unassign.php", params: (a) => ({ crewAssignments_id: a.crewAssignmentId }) },
++  { endpoint: "/api/projects/crew/sortRank.php", params: (a) => ({ projects_id: a.projectId, order: [a.crewAssignmentId] }) },
++  { endpoint: "/api/projects/crew/crewRoles/edit.php", params: (a) => ({ formData: formData({ projects_id: a.projectId, projectsVacantRoles_id: a.vacantRoleId, projectsVacantRoles_name: "Renamed by e2e" }) }) },
++  // Applying for a role would make the user crew, and so let them in
++  { endpoint: "/api/projects/crew/crewRoles/apply.php", params: (a) => ({ formData: formData({ projectsVacantRoles_id: a.vacantRoleId, projectsVacantRolesApplications_applicantComment: "Applied by e2e" }) }) },
++  { endpoint: "/api/projects/crew/crewRoles/accept.php", params: (a) => ({ projectsVacantRolesApplications_id: a.vacancyApplicationId }) },
++  { endpoint: "/api/projects/crew/crewRoles/reject.php", params: (a) => ({ projectsVacantRolesApplications_id: a.vacancyApplicationId }) },
++];
++
++test.describe("changing another project", () => {
++  for (const [i, c] of writes.entries()) {
++    test(`${c.endpoint} (${i}) leaves another project alone`, async ({ asRestricted, asA, tenants: { a }, scope }) => {
++      const before = snapshot(a.instanceId);
++      const response = await asRestricted.api(c.endpoint, c.params(a, scope));
++      const after = snapshot(a.instanceId);
++      expect(refused(response), response.body.slice(0, 500)).toBe(true);
++      expect(after).toEqual(before);
++
++      // Control: the same request from an unrestricted user does change something
++      await asA.api(c.endpoint, c.params(a, scope));
++      expect(snapshot(a.instanceId), "control: the full user's request changes A's records").not.toEqual(before);
++      reseed();
++    });
++  }
++
++  test("the user can still change their own projects", async ({ asRestricted, tenants: { a }, scope }) => {
++    for (const id of [scope.projects.own, scope.projects.managed]) {
++      const renamed = await asRestricted.api("/api/projects/changeDescription.php", { projects_id: id, projects_description: `nopayne changed ${id}` });
++      expect(succeeded(renamed), renamed.body.slice(0, 500)).toBe(true);
++      const note = await asRestricted.api("/api/projects/newNote.php", { projects_id: id, projectsNotes_title: "nopayne note" });
++      expect(succeeded(note), note.body.slice(0, 500)).toBe(true);
++    }
++    reseed();
++  });
++});
++
++test.describe("adding and removing assets", () => {
++  for (const who of ["asClient", "asRestricted"] as const) {
++    test(`${who === "asClient" ? "the client role" : "the restricted user"} can add an asset to their project and take it off again`, async ({ asClient, asRestricted, tenants: { a }, scope }) => {
++      const session = who === "asClient" ? asClient : asRestricted;
++      const added = await session.api("/api/projects/assets/assign.php", { projects_id: scope.projects.own, assets_id: a.spareAssetId });
++      expect(succeeded(added), added.body.slice(0, 500)).toBe(true);
++      expect(bookings(a.spareAssetId)).toEqual([scope.projects.own]);
++
++      // The project page lists it
++      expect(mentions(await session.page(`/project/?id=${scope.projects.own}`), a.spareAssetTag)).toBe(true);
++
++      // As the assets page's basket button removes it
++      const removed = await session.api("/api/projects/assets/unassign.php", { assets_id: a.spareAssetId, projects_id: scope.projects.own });
++      expect(succeeded(removed), removed.body.slice(0, 500)).toBe(true);
++      expect(bookings(a.spareAssetId)).toEqual([]);
++      reseed();
++    });
++  }
++
++  test("the client role can't add an asset to, or take one off, another project", async ({ asClient, tenants: { a } }) => {
++    const before = snapshot(a.instanceId);
++    for (const [endpoint, params] of [
++      ["/api/projects/assets/assign.php", { projects_id: a.projectId, assets_id: a.spareAssetId }],
++      ["/api/projects/assets/assign.php", { projects_id: a.projectId, assetTypes_id: a.assetTypeId }],
++      ["/api/projects/assets/unassign.php", { assetsAssignments: [a.assignmentId] }],
++      ["/api/projects/assets/unassign.php", { assets_id: a.assetId, projects_id: a.projectId }],
++    ] as [string, Params][]) {
++      const response = await asClient.api(endpoint, params);
++      expect(refused(response), `${endpoint}: ${response.body.slice(0, 500)}`).toBe(true);
++    }
++    expect(snapshot(a.instanceId)).toEqual(before);
++    expect(bookings(a.spareAssetId)).toEqual([]);
++    expect(bookings(a.assetId)).toEqual([a.projectId]);
++  });
++});
+diff --git a/e2e/setup/nopayneProjectScope.php b/e2e/setup/nopayneProjectScope.php
+new file mode 100644
+index 00000000..31fb50a0
+--- /dev/null
++++ b/e2e/setup/nopayneProjectScope.php
+@@ -0,0 +1,119 @@
++<?php
++// Test-only (No Payne fork, see NOPAYNE-FORK.md): adds to business A, as seeded by tenants.php, the users and
++// projects the per-project access control tests need. Never run this against a real database.
++//   php nopayneProjectScope.php '<tenants JSON printed by tenants.php>' ['<JSON this script printed last time>']
++//
++// Idempotent: rows are found by the ID they had last time, or else by a natural key, and put back to the values
++// below, so it undoes what a test did.
++//   - "restricted": every permission business A has, plus PROJECTS:VIEW:ONLY_ASSIGNED. Any refusal they get is
++//     down to the restriction, not a missing permission.
++//   - "client": what a client account would be given (the role No Payne asked for), plus the restriction.
++// Both are crew on the "own" project; "restricted" also manages the "managed" project. Neither is on A's
++// seeded project or sub-project, which are the ones they must not reach.
++$db = new PDO(
++    "mysql:host=" . getenv('DB_HOSTNAME') . ";port=" . (getenv('DB_PORT') ?: 3306) . ";dbname=" . getenv('DB_DATABASE'),
++    getenv('DB_USERNAME'),
++    getenv('DB_PASSWORD'),
++    [PDO::ATTR_ERRMODE => PDO::ERRMODE_EXCEPTION, PDO::ATTR_DEFAULT_FETCH_MODE => PDO::FETCH_ASSOC]
++);
++$tenants = json_decode($argv[1], true);
++$a = $tenants['a'];
++$previous = isset($argv[2]) ? json_decode($argv[2], true) : null;
++const RESTRICTION = "PROJECTS:VIEW:ONLY_ASSIGNED";
++const CLIENT_PERMISSIONS = ["PROJECTS:VIEW", RESTRICTION, "PROJECTS:PROJECT_ASSETS:CREATE:ASSIGN_AND_UNASSIGN",
++    "PROJECTS:PROJECT_ASSETS:CREATE:ASSIGN_ALL_BUSINESS_ASSETS", "PROJECTS:PROJECT_CREW:VIEW", "ASSETS:ASSET_TYPES:VIEW"];
++
++function one(string $sql, array $params = []) {
++    global $db;
++    $statement = $db->prepare($sql);
++    $statement->execute($params);
++    return $statement->fetch();
++}
++/** Finds the row (by $rememberedId if it still exists, else by matching $key) or inserts it, then sets $key and $values on it. Returns its ID. */
++function upsert(string $table, string $idColumn, array $key, array $values = [], ?int $rememberedId = null): int {
++    global $db;
++    $row = $rememberedId ? one("SELECT `$idColumn` FROM `$table` WHERE `$idColumn` = ?", [$rememberedId]) : false;
++    if ($row) $values = $key + $values;
++    else {
++        $where = implode(" AND ", array_map(fn($column) => "`$column` <=> ?", array_keys($key)));
++        $row = one("SELECT `$idColumn` FROM `$table` WHERE $where ORDER BY `$idColumn` LIMIT 1", array_values($key));
++    }
++    if (!$row) {
++        $row = $key + $values;
++        $db->prepare("INSERT INTO `$table` (" . implode(",", array_map(fn($c) => "`$c`", array_keys($row))) . ") VALUES (" . implode(",", array_fill(0, count($row), "?")) . ")")
++            ->execute(array_values($row));
++        return (int) $db->lastInsertId();
++    }
++    if ($values) {
++        $db->prepare("UPDATE `$table` SET " . implode(",", array_map(fn($c) => "`$c` = ?", array_keys($values))) . " WHERE `$idColumn` = ?")
++            ->execute([...array_values($values), $row[$idColumn]]);
++    }
++    return (int) $row[$idColumn];
++}
++
++$fullActions = one("SELECT instancePositions_actions FROM instancePositions WHERE instancePositions_id = ?", [$a['positions']['full']])['instancePositions_actions'];
++$positions = [
++    "restricted" => upsert("instancePositions", "instancePositions_id", ["instances_id" => $a['instanceId'], "instancePositions_displayName" => "E2E nopayne restricted"], [
++        "instancePositions_rank" => 3, "instancePositions_deleted" => 0, "instancePositions_actions" => $fullActions . "," . RESTRICTION, "cmsPages_id" => null,
++    ]),
++    "client" => upsert("instancePositions", "instancePositions_id", ["instances_id" => $a['instanceId'], "instancePositions_displayName" => "E2E nopayne client"], [
++        "instancePositions_rank" => 4, "instancePositions_deleted" => 0, "instancePositions_actions" => implode(",", CLIENT_PERMISSIONS), "cmsPages_id" => null,
++    ]),
++];
++
++// Users are copies of A's limited user (same password, "password!", and the same dev-site server position)
++$template = one("SELECT * FROM users WHERE users_userid = ?", [$a['users']['limited']['id']]);
++$devPosition = one("SELECT * FROM userPositions WHERE users_userid = ? ORDER BY userPositions_id LIMIT 1", [$a['users']['limited']['id']]);
++$users = [];
++foreach ($positions as $kind => $position) {
++    $email = "e2e_nopayne_$kind@example.com";
++    $values = $template;
++    unset($values['users_userid'], $values['users_email']);
++    $values = array_merge($values, ["users_username" => "e2e_nopayne_$kind", "users_name1" => ucfirst($kind), "users_name2" => "E2E nopayne user",
++        "users_deleted" => 0, "users_suspended" => 0, "users_changepass" => 0, "users_selectedInstanceIDLast" => null]);
++    $id = upsert("users", "users_userid", ["users_email" => $email], $values);
++    $db->prepare("DELETE FROM loginAttempts WHERE loginAttempts_textEntered = ?")->execute([$email]);
++    $db->prepare("DELETE FROM userPositions WHERE users_userid = ?")->execute([$id]);
++    $userPosition = $devPosition;
++    unset($userPosition['userPositions_id']);
++    $userPosition['users_userid'] = $id;
++    $db->prepare("INSERT INTO userPositions (" . implode(",", array_map(fn($c) => "`$c`", array_keys($userPosition))) . ") VALUES (" . implode(",", array_fill(0, count($userPosition), "?")) . ")")
++        ->execute(array_values($userPosition));
++    $db->prepare("UPDATE userInstances SET userInstances_deleted = 1 WHERE users_userid = ? AND instancePositions_id != ?")->execute([$id, $position]);
++    upsert("userInstances", "userInstances_id", ["users_userid" => $id, "instancePositions_id" => $position], [
++        "userInstances_deleted" => 0, "userInstances_archived" => null, "userInstances_extraPermissions" => null, "userInstances_label" => "E2E nopayne $kind",
++    ]);
++    $users[$kind] = ["id" => $id, "email" => $email];
++}
++
++// Copies A's seeded project (client, type, status...) with its own name and dates
++$base = one("SELECT * FROM projects WHERE projects_id = ?", [$a['projectId']]);
++unset($base['projects_id']);
++$projects = [];
++foreach (["own" => $a['users']['full']['id'], "managed" => $users['restricted']['id']] as $kind => $manager) {
++    $values = array_merge($base, ["projects_name" => "nopayne $kind project", "projects_manager" => $manager, "projects_deleted" => 0, "projects_archived" => 0,
++        "projects_parent_project_id" => null, "projects_dates_deliver_start" => "2032-03-01 09:00:00", "projects_dates_deliver_end" => "2032-03-05 18:00:00",
++        "projects_dates_use_start" => "2032-03-02 09:00:00", "projects_dates_use_end" => "2032-03-04 18:00:00"]);
++    unset($values['projects_description']);
++    $projects[$kind] = upsert("projects", "projects_id", ["instances_id" => $a['instanceId'], "projects_description" => "nopayne $kind project description"], $values, $previous['projects'][$kind] ?? null);
++    upsert("projectsFinanceCache", "projectsFinanceCache_id", ["projects_id" => $projects[$kind]], [
++        "projectsFinanceCache_timestamp" => "2024-01-01 00:00:00", "projectsFinanceCache_timestampUpdated" => null,
++        "projectsFinanceCache_equipmentSubTotal" => 0, "projectsFinanceCache_equiptmentDiscounts" => 0, "projectsFinanceCache_equiptmentTotal" => 0,
++        "projectsFinanceCache_salesTotal" => 0, "projectsFinanceCache_staffTotal" => 0, "projectsFinanceCache_externalHiresTotal" => 0,
++        "projectsFinanceCache_paymentsReceived" => 0, "projectsFinanceCache_grandTotal" => 0, "projectsFinanceCache_value" => 0, "projectsFinanceCache_mass" => 0,
++    ]);
++    // Assets tests put on the project come off again
++    $db->prepare("UPDATE assetsAssignments SET assetsAssignments_deleted = 1 WHERE projects_id = ?")->execute([$projects[$kind]]);
++}
++// Projects tests created that these users manage (e.g. a sub-project made by new.php) would let them see more
++$db->prepare("UPDATE projects SET projects_deleted = 1 WHERE instances_id = ? AND projects_manager IN (?, ?) AND projects_id NOT IN (?, ?)")
++    ->execute([$a['instanceId'], $users['restricted']['id'], $users['client']['id'], $projects['own'], $projects['managed']]);
++// Crew: both users on "own"; no-one from these tests on anything else
++foreach ($users as $kind => $user) {
++    $db->prepare("UPDATE crewAssignments SET crewAssignments_deleted = 1 WHERE users_userid = ? AND projects_id != ?")->execute([$user['id'], $projects['own']]);
++    upsert("crewAssignments", "crewAssignments_id", ["projects_id" => $projects['own'], "users_userid" => $user['id']], [
++        "crewAssignments_role" => "nopayne $kind crew", "crewAssignments_comment" => null, "crewAssignments_deleted" => 0, "crewAssignments_personName" => null, "crewAssignments_rank" => 1,
++    ]);
++}
++
++echo json_encode(["users" => $users, "positions" => $positions, "projects" => $projects], JSON_PRETTY_PRINT) . "\n";
+diff --git a/e2e/setup/tenants.php b/e2e/setup/tenants.php
+index cb8ca2c2..6863f075 100644
+--- a/e2e/setup/tenants.php
++++ b/e2e/setup/tenants.php
+@@ -105,7 +105,7 @@ function tenant(string $letter): array {
+     ]);
+ 
+     $fullPosition = upsert("instancePositions", "instancePositions_id", ["instances_id" => $instance, "instancePositions_displayName" => "$marker full access"], [
+-        "instancePositions_rank" => 1, "instancePositions_deleted" => 0, "instancePositions_actions" => implode(",", array_keys($instanceActions)), "cmsPages_id" => null,
++        "instancePositions_rank" => 1, "instancePositions_deleted" => 0, "instancePositions_actions" => implode(",", array_diff(array_keys($instanceActions), ["PROJECTS:VIEW:ONLY_ASSIGNED"])), "cmsPages_id" => null, // No Payne fork: the restriction isn't a grant
+     ]);
+     $limitedPosition = upsert("instancePositions", "instancePositions_id", ["instances_id" => $instance, "instancePositions_displayName" => "$marker limited"], [
+         "instancePositions_rank" => 2, "instancePositions_deleted" => 0, "instancePositions_actions" => implode(",", LIMITED_PERMISSIONS), "cmsPages_id" => null,
+diff --git a/src/api/apiHeadSecure.php b/src/api/apiHeadSecure.php
+index 558a04b2..ec6c3b7a 100644
+--- a/src/api/apiHeadSecure.php
++++ b/src/api/apiHeadSecure.php
+@@ -26,4 +26,5 @@ $DBLIB->insert("analyticsEvents", [
+     "analyticsEvents_path" => strtok($_SERVER["REQUEST_URI"], '?'),
+     "analyticsEvents_action" => "API-CALL",
+     "analyticsEvents_payload" => ($analyticsPayload !== null && strlen($analyticsPayload) > 65535) ? null : $analyticsPayload,
+-]);
+\ No newline at end of file
++]);
++nopayneProjectScopeRequestGuard(); // No Payne fork: per-project access control
+diff --git a/src/api/file/index.php b/src/api/file/index.php
+index 5efd43bb..91bc1049 100644
+--- a/src/api/file/index.php
++++ b/src/api/file/index.php
+@@ -1,5 +1,6 @@
+ <?php
+ require_once __DIR__ . '/../apiHead.php';
++nopayneProjectScopeRequestGuard(); // No Payne fork: per-project access control
+ /*
+  * File interface for Amazon AWS S3.
+  *  Parameters
+diff --git a/src/api/instances/new.php b/src/api/instances/new.php
+index a4c63bae..a6c03b9d 100644
+--- a/src/api/instances/new.php
++++ b/src/api/instances/new.php
+@@ -30,7 +30,7 @@ $position = $DBLIB->insert("instancePositions", [
+     "instances_id" => $instance,
+     "instancePositions_displayName" => "Administrator",
+     "instancePositions_rank" => 1,
+-    "instancePositions_actions" => implode(",", array_keys($instanceActions))
++    "instancePositions_actions" => implode(",", array_diff(array_keys($instanceActions), [NOPAYNE_PROJECT_SCOPE_PERMISSION])) // No Payne fork: the restriction isn't a grant
+ ]);
+ if (!$position) finish(false, ["code" => "CREATE-POSITION-FAIL", "message" => "Could not create new business"]);
+ 
+diff --git a/src/api/projects/crew/assign.php b/src/api/projects/crew/assign.php
+index e438069d..43ad5219 100644
+--- a/src/api/projects/crew/assign.php
++++ b/src/api/projects/crew/assign.php
+@@ -45,6 +45,7 @@ foreach ($_POST['users'] as $user) {
+             $DBLIB->where("projectsStatuses.projectsStatuses_assetsReleased", 0);
+             $DBLIB->where("((projects_dates_use_start >= '" . $project["projects_dates_use_start"] . "' AND projects_dates_use_start <= '" . $project["projects_dates_use_end"] . "') OR (projects_dates_use_end >= '" . $project["projects_dates_use_start"] . "' AND projects_dates_use_end <= '" . $project["projects_dates_use_end"] . "') OR (projects_dates_use_end >= '" . $project["projects_dates_use_end"] . "' AND projects_dates_use_start <= '" . $project["projects_dates_use_start"] . "'))");
+             $existingAssignments = $DBLIB->get("crewAssignments", null, ["crewAssignments.projects_id", "projects.projects_name", "crewAssignments.crewAssignments_role"]);
++            nopayneProjectScopeRedact($existingAssignments); // No Payne fork: per-project access control
+         } else $existingAssignments = [];
+         //Allow crew to be clashed - but it'll warn them in the notification.
+     } else {
+diff --git a/src/api/projects/data.php b/src/api/projects/data.php
+index 467ded7f..c59fcfd3 100644
+--- a/src/api/projects/data.php
++++ b/src/api/projects/data.php
+@@ -32,6 +32,7 @@ if (!$PAGEDATA['project']) $PAGEDATA['USE_TWIG_404'] ? die($TWIG->render('404.tw
+ $DBLIB->where("projects.instances_id", $AUTH->data['instance']['instances_id']);
+ $DBLIB->where("projects.projects_deleted", 0);
+ $DBLIB->where("projects.projects_parent_project_id", $_GET['id']);
++nopayneProjectScopeWhere(); // No Payne fork: per-project access control
+ $DBLIB->join("projectsStatuses", "projects.projectsStatuses_id=projectsStatuses.projectsStatuses_id", "LEFT");
+ $PAGEDATA['project']['subProjects'] = $DBLIB->get("projects", null, ["projects.*", "projectsStatuses.projectsStatuses_name", "projectsStatuses.projectsStatuses_foregroundColour","projectsStatuses.projectsStatuses_backgroundColour"]);
+ 
+diff --git a/src/api/projects/list.php b/src/api/projects/list.php
+index ceeede7e..268e3d71 100644
+--- a/src/api/projects/list.php
++++ b/src/api/projects/list.php
+@@ -5,6 +5,7 @@ $return = [];
+ if (!$AUTH->instancePermissionCheck("PROJECTS:VIEW")) die("401");
+ 
+ $DBLIB->where("projects.instances_id", $AUTH->data['instance']['instances_id']);
++nopayneProjectScopeWhere(); // No Payne fork: per-project access control
+ $DBLIB->where("projects.projects_deleted", 0);
+ $DBLIB->where("projects.projects_archived", 0);
+ $DBLIB->join("clients", "projects.clients_id=clients.clients_id", "LEFT");
+@@ -23,6 +24,7 @@ foreach ($projects as $project) {
+ 
+     if (isset($_POST['subprojects'])) {
+         $DBLIB->where("projects.projects_parent_project_id", $project['projects_id']);
++        nopayneProjectScopeWhere(); // No Payne fork: per-project access control
+         $DBLIB->where("projects.projects_deleted", 0);
+         $DBLIB->where("projects.projects_archived", 0);
+         $DBLIB->join("clients", "projects.clients_id=clients.clients_id", "LEFT");
+diff --git a/src/asset.php b/src/asset.php
+index 18bf29fe..8000c830 100644
+--- a/src/asset.php
++++ b/src/asset.php
+@@ -55,6 +55,7 @@ foreach ($assets as $asset) {
+     $DBLIB->join("projectsStatuses", "projects.projectsStatuses_id=projectsStatuses.projectsStatuses_id", "LEFT");
+     $DBLIB->where("projects.projects_deleted", 0);
+     $asset['assignments'] = $DBLIB->get("assetsAssignments", null, ["assetsAssignments.projects_id", "projects.projects_name", "projects_dates_deliver_start", "projects_dates_deliver_end", "assetsAssignments.assetsAssignmentsStatus_id", "projectsStatuses.projectsStatuses_name", "projectsStatuses.projectsStatuses_foregroundColour", "projectsStatuses.projectsStatuses_backgroundColour"]);
++    nopayneProjectScopeRedact($asset['assignments']); // No Payne fork: per-project access control
+ 
+     //Files
+     $asset['files'] = $bCMS->s3List(4, $asset['assets_id']);
+diff --git a/src/assets.php b/src/assets.php
+index 2053fda9..6443fd09 100644
+--- a/src/assets.php
++++ b/src/assets.php
+@@ -228,6 +228,7 @@ foreach ($assets as $asset) {
+                 $DBLIB->where("(projectsStatuses.projectsStatuses_assetsReleased = 0 OR projects.projects_id = '" . $RETURN['PROJECT']['ID'] . "')");
+             } else $DBLIB->where("projectsStatuses.projectsStatuses_assetsReleased", 0);
+             $tag['assignment'] = $DBLIB->get("assetsAssignments", null, ["assetsAssignments.assetsAssignments_id", "assetsAssignments.projects_id", "projects.projects_name"]);
++            nopayneProjectScopeRedact($tag['assignment']); // No Payne fork: per-project access control
+         }
+         $tag['flagsblocks'] = assetFlagsAndBlocks($tag['assets_id']);
+         if ($tag['assignment'] or $tag['flagsblocks']['COUNT']['BLOCK'] > 0) $asset['countBlocked']++;
+@@ -243,6 +244,7 @@ $PAGEDATA['searchOptions'] = [];
+ 
+ // Projects for search
+ $DBLIB->where("projects.instances_id", $AUTH->data['instance']['instances_id']);
++nopayneProjectScopeWhere(); // No Payne fork: per-project access control
+ $DBLIB->where("projects.projects_deleted", 0);
+ $DBLIB->where("projects.projects_archived", 0);
+ $DBLIB->where("projects.projects_dates_deliver_start",NULL,"IS NOT");
+diff --git a/src/clients.php b/src/clients.php
+index a0cc7b2f..2ed7016a 100644
+--- a/src/clients.php
++++ b/src/clients.php
+@@ -45,6 +45,7 @@ $PAGEDATA['clients'] = [];
+ foreach ($clients as $client) {
+ 	$DBLIB->where("clients_id", $client['clients_id']);
+ 	$DBLIB->where("projects_deleted", 0);
++	nopayneProjectScopeWhere(); // No Payne fork: per-project access control
+ 	$DBLIB->join("projectsTypes", "projects.projectsTypes_id=projectsTypes.projectsTypes_id");
+ 	$DBLIB->join("projectsStatuses", "projects.projectsStatuses_id=projectsStatuses.projectsStatuses_id", "LEFT");
+ 	$DBLIB->where("projectsTypes.projectsTypes_config_finance", 1);
+diff --git a/src/common/head.php b/src/common/head.php
+index 665d262c..3cc72ef5 100644
+--- a/src/common/head.php
++++ b/src/common/head.php
+@@ -386,3 +386,4 @@ if ($CONFIG['CSP_ENABLED'] === "Enabled") {
+ // Include the Auth class
+ require_once __DIR__ . '/libs/Auth/main.php';
+ $GLOBALS['AUTH'] = new bID;
++require_once __DIR__ . '/libs/Auth/nopayneProjectScope.php'; // No Payne fork: per-project access control
+diff --git a/src/common/headSecure.php b/src/common/headSecure.php
+index 3b77cec0..9f80f47a 100644
+--- a/src/common/headSecure.php
++++ b/src/common/headSecure.php
+@@ -69,6 +69,7 @@ if ($CONFIG['LINKS_TERMSOFSERVICEURL'] and ($PAGEDATA['USERDATA']['users_termsAc
+     }
+     //get all projects
+     $DBLIB->where("projects.instances_id", $AUTH->data['instance']['instances_id']);
++    nopayneProjectScopeWhere(); // No Payne fork: per-project access control
+     $DBLIB->where("projects.projects_deleted", 0);
+     $DBLIB->where("projects.projects_archived", 0);
+     $DBLIB->join("clients", "projects.clients_id=clients.clients_id", "LEFT");
+@@ -130,3 +131,4 @@ if ($CONFIG['LINKS_TERMSOFSERVICEURL'] and ($PAGEDATA['USERDATA']['users_termsAc
+     $PAGEDATA['pageConfig'] = ["TITLE" => "No Businesses", "BREADCRUMB" => false, "NOMENU" => true];
+     die($TWIG->render('index_noInstances.twig', $PAGEDATA));
+ }
++nopayneProjectScopeRequestGuard(); // No Payne fork: per-project access control
+diff --git a/src/common/libs/Auth/instanceActions.php b/src/common/libs/Auth/instanceActions.php
+index 8f889cd7..f4ce816f 100644
+--- a/src/common/libs/Auth/instanceActions.php
++++ b/src/common/libs/Auth/instanceActions.php
+@@ -1679,6 +1679,18 @@ $instanceActions = [
+     'LEGACY-ID' => 20,
+     'LEGACY-Sort Rank' => 14,
+   ],
++  // No Payne fork (see NOPAYNE-FORK.md and Auth/nopayneProjectScope.php): a restriction, not a grant
++  'PROJECTS:VIEW:ONLY_ASSIGNED' => [
++    'Category' => 'Projects',
++    'Table' => 'Projects',
++    'Type' => 'View',
++    'Detail' => 'Only Assigned',
++    'Combined Text Description' => 'Projects: View  - Only Assigned (RESTRICTS the user to projects they manage or are crew on)',
++    'Dependencies' => ['PROJECTS:VIEW'],
++    'Comment' => 'Restricts the user to projects they manage or are crew on',
++    'Supported Token Types' => ["web-session", "app-v1", "app-v2-magic-email"],
++    'Caution' => 'This takes access away: a user with it can only see and change projects they manage or are crew on',
++  ],
+   'TRAINING:CREATE' => [
+     'Category' => 'Training',
+     'Table' => 'Training',
+diff --git a/src/common/libs/Auth/nopayneProjectScope.php b/src/common/libs/Auth/nopayneProjectScope.php
+new file mode 100644
+index 00000000..a614fda3
+--- /dev/null
++++ b/src/common/libs/Auth/nopayneProjectScope.php
+@@ -0,0 +1,220 @@
++<?php
++/**
++ * No Payne fork: per-project access control. See NOPAYNE-FORK.md at the repo root.
++ *
++ * A user whose role in a business has PROJECTS:VIEW:ONLY_ASSIGNED ("restricted") can only see and touch the
++ * projects in that business they manage (projects_manager) or are crew on (crewAssignments). Everyone else,
++ * including server admins with INSTANCES:FULL_PERMISSIONS_IN_INSTANCE, is unaffected.
++ *
++ * All the logic lives here so upstream merges only meet one-line hooks:
++ *   - nopayneProjectScopeRequestGuard() runs at the end of headSecure.php / apiHeadSecure.php (and in
++ *     api/file/index.php). It finds every project a request refers to - directly (projects_id, ...) or through
++ *     a child record (assetsAssignments_id, payments_id, s3files_id, ...) - and refuses the request if one of
++ *     them is out of scope.
++ *   - nopayneProjectScopeWhere() is called before each query that lists projects, to limit it to the user's.
++ *   - nopayneProjectScopeRedact() blanks the names of other projects in rows that only mention them in passing
++ *     (an asset's "assigned to X", a crew clash warning).
++ *
++ * The lookups use the raw mysqli connection rather than the $DBLIB query builder, so they can run while a
++ * caller is half-way through building a query without disturbing it.
++ */
++
++const NOPAYNE_PROJECT_SCOPE_PERMISSION = "PROJECTS:VIEW:ONLY_ASSIGNED";
++
++// SQL giving the project a child record belongs to (one ? = the record's ID)
++const NOPAYNE_PROJECT_SCOPE_LOOKUPS = [
++    "project" => null,
++    "assetsAssignments" => "SELECT projects_id FROM assetsAssignments WHERE assetsAssignments_id = ?",
++    "payments" => "SELECT projects_id FROM payments WHERE payments_id = ?",
++    "crewAssignments" => "SELECT projects_id FROM crewAssignments WHERE crewAssignments_id = ?",
++    "projectsNotes" => "SELECT projects_id FROM projectsNotes WHERE projectsNotes_id = ?",
++    "projectsVacantRoles" => "SELECT projects_id FROM projectsVacantRoles WHERE projectsVacantRoles_id = ?",
++    "projectsVacantRolesApplications" => "SELECT projectsVacantRoles.projects_id FROM projectsVacantRolesApplications JOIN projectsVacantRoles ON projectsVacantRoles.projectsVacantRoles_id = projectsVacantRolesApplications.projectsVacantRoles_id WHERE projectsVacantRolesApplications_id = ?",
++    // Project files (7), invoices/quotes/delivery notes (20-22), payment files (14) and vacancy files (18). Other files give NULL.
++    "s3files" => "SELECT CASE WHEN s3files_meta_type IN (7, 20, 21, 22) THEN s3files_meta_subType
++        WHEN s3files_meta_type = 14 THEN (SELECT projects_id FROM payments WHERE payments_id = s3files_meta_subType)
++        WHEN s3files_meta_type = 18 THEN (SELECT projects_id FROM projectsVacantRoles WHERE projectsVacantRoles_id = s3files_meta_subType)
++        END FROM s3files WHERE s3files_id = ?",
++];
++
++// Request parameters that name a project or one of its records, on any endpoint or page
++const NOPAYNE_PROJECT_SCOPE_PARAMS = [
++    "projects_id" => "project",
++    "projects_parent_project_id" => "project",
++    "assetsAssignments_id" => "assetsAssignments",
++    "assetsAssignments" => "assetsAssignments",
++    "payments_id" => "payments",
++    "crewAssignments_id" => "crewAssignments",
++    "projectsNotes_id" => "projectsNotes",
++    "projectsVacantRoles_id" => "projectsVacantRoles",
++    "projectsVacantRolesApplications_id" => "projectsVacantRolesApplications",
++    "s3files_id" => "s3files",
++];
++
++// Parameters whose meaning depends on the script (path relative to src/)
++const NOPAYNE_PROJECT_SCOPE_SCRIPT_PARAMS = [
++    "api/projects/data.php" => ["id" => "project"],
++    "project/index.php" => ["id" => "project"],
++    "project/projectInvoice.php" => ["id" => "project"],
++    "project/crew/vacantCrew.php" => ["id" => "project"],
++    "project/noteExport.php" => ["id" => "projectsNotes"],
++    "project/crew/vacancy.php" => ["id" => "projectsVacantRoles"],
++    "project/crew/applications.php" => ["id" => "projectsVacantRoles"],
++    "api/s3files/uploadProjectInvoice.php" => ["id" => "project"],
++    "assets.php" => ["project" => "project", "project_referer" => "project"],
++    "api/file/index.php" => ["f" => "s3files"],
++];
++
++// File types (s3files_meta_type) attached to a project or one of its records, for uploads (typeid + subtype)
++const NOPAYNE_PROJECT_SCOPE_FILE_TYPES = [7 => "project", 20 => "project", 21 => "project", 22 => "project", 14 => "payments", 18 => "projectsVacantRoles"];
++
++/** Whether the user is restricted in the given business (default: the current one) */
++function nopayneProjectScopeRestricted($instanceId = null): bool
++{
++    global $AUTH;
++    if (!isset($AUTH) or !$AUTH->login) return false;
++    if ($AUTH->serverPermissionCheck("INSTANCES:FULL_PERMISSIONS_IN_INSTANCE")) return false;
++    if ($instanceId === null) {
++        if (!$AUTH->data['instance']) return false;
++        $instanceId = $AUTH->data['instance']['instances_id'];
++    }
++    foreach ($AUTH->data['instances'] as $instance) {
++        if ($instance['instances_id'] == $instanceId) return in_array(NOPAYNE_PROJECT_SCOPE_PERMISSION, $instance['permissions'] ?? []);
++    }
++    return false;
++}
++
++/** Runs one lookup on the raw connection (doesn't touch $DBLIB's query builder). Returns the first column of every row. */
++function nopayneProjectScopeQuery(string $sql, array $params): array
++{
++    global $DBLIB;
++    $statement = $DBLIB->mysqli()->prepare($sql);
++    if (!$statement) throw new Exception("Project scope lookup failed");
++    if ($params) $statement->bind_param(str_repeat("s", count($params)), ...array_map("strval", $params));
++    $statement->execute();
++    $result = $statement->get_result();
++    $values = [];
++    while ($row = $result->fetch_row()) $values[] = $row[0];
++    $statement->close();
++    return $values;
++}
++
++/** IDs of the projects in a business the user manages or is crew on */
++function nopayneProjectScopeIds($instanceId = null): array
++{
++    global $AUTH;
++    static $cache = [];
++    if ($instanceId === null) $instanceId = $AUTH->data['instance']['instances_id'];
++    if (!isset($cache[$instanceId])) {
++        $userId = $AUTH->data['users_userid'];
++        $cache[$instanceId] = array_map("intval", nopayneProjectScopeQuery(
++            "SELECT projects_id FROM projects WHERE instances_id = ? AND projects_deleted = 0 AND (projects_manager = ?
++                OR projects_id IN (SELECT projects_id FROM crewAssignments WHERE users_userid = ? AND crewAssignments_deleted = 0))",
++            [$instanceId, $userId, $userId]
++        ));
++    }
++    return $cache[$instanceId];
++}
++
++/** Whether the user may see/touch a project. Projects that don't exist are let through for the page's own checks to refuse. */
++function nopayneProjectScopeCanAccess($projectId): bool
++{
++    $instance = nopayneProjectScopeQuery("SELECT instances_id FROM projects WHERE projects_id = ?", [$projectId]);
++    if (!$instance or !nopayneProjectScopeRestricted($instance[0])) return true;
++    return in_array((int) $projectId, nopayneProjectScopeIds($instance[0]), true);
++}
++
++/** Limits the query being built to the user's projects, if they're restricted. $column is the projects_id column to filter on. */
++function nopayneProjectScopeWhere(string $column = "projects.projects_id"): void
++{
++    global $DBLIB;
++    if (!nopayneProjectScopeRestricted()) return;
++    $DBLIB->where($column, nopayneProjectScopeIds() ?: [0], "IN"); // [0] matches nothing; an empty IN () is a syntax error
++}
++
++/** Replaces the names of projects out of the user's scope in rows (each with projects_id and projects_name) */
++function nopayneProjectScopeRedact(&$rows): void
++{
++    if (!is_array($rows) or !nopayneProjectScopeRestricted()) return;
++    foreach ($rows as &$row) {
++        if (isset($row['projects_id']) and !in_array((int) $row['projects_id'], nopayneProjectScopeIds(), true)) $row['projects_name'] = "another project";
++    }
++}
++
++/** Refuses the request: a 404 page, or the API's usual error */
++function nopayneProjectScopeDeny(): void
++{
++    global $TWIG, $PAGEDATA;
++    if (function_exists("finish")) finish(false, ["code" => "AUTH-ERROR", "message" => "No auth for action"]);
++    http_response_code(404);
++    if (isset($PAGEDATA['USERDATA'])) die($TWIG->render('404.twig', $PAGEDATA));
++    die("404");
++}
++
++/** Every scalar in a request value (which may be an array of IDs) that could name a record */
++function nopayneProjectScopeValues($value): array
++{
++    if (is_array($value)) return array_merge([], ...array_map("nopayneProjectScopeValues", array_values($value)));
++    if (is_object($value)) return nopayneProjectScopeValues((array) $value);
++    // MySQL compares "12abc" = 12 as 12, so check what it would match
++    return (is_scalar($value) and (int) $value > 0) ? [(int) $value] : [];
++}
++
++/** The project IDs a request refers to */
++function nopayneProjectScopeRequestProjects(): array
++{
++    // Fields can come in $_GET, $_POST or as {name, value} pairs in formData (which data.php copies into $_GET)
++    $fields = [];
++    foreach ([$_GET, $_POST] as $source) {
++        foreach ($source as $name => $value) $fields[] = [$name, $value];
++        if (isset($source['formData']) and is_array($source['formData'])) {
++            foreach ($source['formData'] as $item) {
++                if (is_array($item) and isset($item['name'], $item['value']) and is_string($item['name'])) $fields[] = [$item['name'], $item['value']];
++            }
++        }
++    }
++    $script = realpath($_SERVER['SCRIPT_FILENAME'] ?? "");
++    $root = realpath(__DIR__ . "/../../..") . DIRECTORY_SEPARATOR;
++    $script = ($script and str_starts_with($script, $root)) ? str_replace(DIRECTORY_SEPARATOR, "/", substr($script, strlen($root))) : "";
++    $params = NOPAYNE_PROJECT_SCOPE_PARAMS + (NOPAYNE_PROJECT_SCOPE_SCRIPT_PARAMS[$script] ?? []);
++
++    $projects = [];
++    foreach ($fields as [$name, $value]) {
++        if (!isset($params[$name])) continue;
++        foreach (nopayneProjectScopeValues($value) as $id) {
++            $sql = NOPAYNE_PROJECT_SCOPE_LOOKUPS[$params[$name]];
++            if ($sql === null) $projects[] = $id;
++            else $projects = array_merge($projects, nopayneProjectScopeQuery($sql, [$id]));
++        }
++    }
++    // File uploads say what they're attached to with typeid + subtype
++    foreach ([$_GET, $_POST] as $source) {
++        if (!isset($source['typeid'], $source['subtype']) or !is_scalar($source['typeid'])) continue;
++        $type = NOPAYNE_PROJECT_SCOPE_FILE_TYPES[(int) $source['typeid']] ?? false;
++        if (!$type) continue;
++        foreach (nopayneProjectScopeValues($source['subtype']) as $id) {
++            $sql = NOPAYNE_PROJECT_SCOPE_LOOKUPS[$type];
++            if ($sql === null) $projects[] = $id;
++            else $projects = array_merge($projects, nopayneProjectScopeQuery($sql, [$id]));
++        }
++    }
++    return array_unique(array_filter(array_map("intval", $projects)));
++}
++
++/**
++ * Refuses the request if it refers to a project the user can't access. Cheap for everyone else: nothing is
++ * looked up unless the user is restricted in at least one of their businesses.
++ */
++function nopayneProjectScopeRequestGuard(): void
++{
++    global $AUTH;
++    if (!isset($AUTH) or !$AUTH->login) return;
++    $restrictedSomewhere = false;
++    foreach ($AUTH->data['instances'] as $instance) {
++        if (in_array(NOPAYNE_PROJECT_SCOPE_PERMISSION, $instance['permissions'] ?? [])) $restrictedSomewhere = true;
++    }
++    if (!$restrictedSomewhere or $AUTH->serverPermissionCheck("INSTANCES:FULL_PERMISSIONS_IN_INSTANCE")) return;
++    foreach (nopayneProjectScopeRequestProjects() as $projectId) {
++        if (!nopayneProjectScopeCanAccess($projectId)) nopayneProjectScopeDeny();
++    }
++}
+diff --git a/src/common/libs/Search/SearchProjects.php b/src/common/libs/Search/SearchProjects.php
+index 68e5337d..c806b3ea 100644
+--- a/src/common/libs/Search/SearchProjects.php
++++ b/src/common/libs/Search/SearchProjects.php
+@@ -18,6 +18,7 @@ class SearchProjects extends BaseSearch
+         // Get the projects
+         $this->DBLIB->where("projects.instances_id", $this->AUTH->data['instance']['instances_id']);
+         $this->DBLIB->where("projects.projects_deleted", 0);
++        nopayneProjectScopeWhere(); // No Payne fork: per-project access control
+         $this->DBLIB->join("clients", "projects.clients_id=clients.clients_id", "LEFT");
+         $this->DBLIB->join("users", "projects.projects_manager=users.users_userid",);
+         $projects = $this->DBLIB->get("projects", null, ["projects_id", "projects_archived", "projects_name", "projects_description", "clients_name", "projects_dates_deliver_start", "projects_dates_deliver_end", "projects_dates_use_start", "projects_dates_use_end", "projects_manager as projects_manager_id", "concat(users_name1, ' ', users_name2) AS projects_manager"]);
+diff --git a/src/instances/calendar.php b/src/instances/calendar.php
+index 604b06d5..b6651312 100644
+--- a/src/instances/calendar.php
++++ b/src/instances/calendar.php
+@@ -26,6 +26,8 @@ if (isset($_GET['location'])) {
+ } else $PAGEDATA['LOCATION'] = false;
+ 
+ $DBLIB->where("projects.instances_id", $AUTH->data['instance']['instances_id']);
++nopayneProjectScopeWhere(); // No Payne fork: per-project access control
++if (nopayneProjectScopeRestricted()) $PAGEDATA['USERDATA']['instance']['instances_calendarHash'] = null; // No Payne fork: the business feed has every project in it
+ if ($PAGEDATA['LOCATION']) $DBLIB->where("projects.locations_id", $PAGEDATA['LOCATION']['locations_id']);
+ else $DBLIB->where("projects.projects_archived", 0);
+ $DBLIB->where("projects.projects_deleted", 0);
+diff --git a/src/ledger.php b/src/ledger.php
+index 6f9dc187..c601d2ad 100644
+--- a/src/ledger.php
++++ b/src/ledger.php
+@@ -15,6 +15,7 @@ $DBLIB->pageLimit = 20; //Users per page
+ $DBLIB->join("projects", "payments.projects_id=projects.projects_id", "LEFT");
+ $DBLIB->join("clients", "projects.clients_id=clients.clients_id", "LEFT");
+ $DBLIB->where("projects.instances_id",$AUTH->data['instance']['instances_id']);
++nopayneProjectScopeWhere(); // No Payne fork: per-project access control
+ $DBLIB->where("payments.payments_deleted", 0);
+ $DBLIB->where("payments.payments_type", 1);
+ $DBLIB->orderBy("payments.payments_date", "DESC");
+diff --git a/src/project/crew/vacancies.php b/src/project/crew/vacancies.php
+index e0438a78..229970f1 100644
+--- a/src/project/crew/vacancies.php
++++ b/src/project/crew/vacancies.php
+@@ -13,6 +13,7 @@ $DBLIB->join("projects","projectsVacantRoles.projects_id=projects.projects_id","
+ $DBLIB->join("clients", "projects.clients_id=clients.clients_id", "LEFT");
+ $DBLIB->join("users", "projects.projects_manager=users.users_userid", "LEFT");
+ $DBLIB->where("projects.instances_id", $AUTH->data['instance']['instances_id']);
++nopayneProjectScopeWhere(); // No Payne fork: per-project access control
+ $DBLIB->where("projects.projects_deleted", 0);
+ $DBLIB->where("projects.projects_archived", 0);
+ $DBLIB->where("(projects.projects_dates_use_end IS NULL OR projects.projects_dates_use_end >= '" . date("Y-m-d H:i:s") . "')");
+diff --git a/src/project/list.php b/src/project/list.php
+index f9a4c4a7..f834f8a8 100644
+--- a/src/project/list.php
++++ b/src/project/list.php
+@@ -38,6 +38,7 @@ if (isset($_GET['page'])) $page = $bCMS->sanitizeString($_GET['page']);
+ else $page = 1;
+ $DBLIB->pageLimit = (isset($_GET['pageLimit']) ? $_GET['pageLimit'] : 30);
+ $DBLIB->where("projects.instances_id", $AUTH->data['instance']['instances_id']);
++nopayneProjectScopeWhere(); // No Payne fork: per-project access control
+ $DBLIB->where("projects.projects_deleted", 0);
+ $DBLIB->where("projects.projects_parent_project_id IS NULL");
+ if (strlen($PAGEDATA['search']) > 0) {
+@@ -67,6 +68,7 @@ foreach ($projectlist as $project) {
+     $project['finance'] = $DBLIB->getOne("projectsFinanceCache");
+ 
+     $DBLIB->where("projects_parent_project_id", $project['projects_id']);
++    nopayneProjectScopeWhere(); // No Payne fork: per-project access control
+     $DBLIB->where("projects.instances_id", $AUTH->data['instance']['instances_id']);
+     $DBLIB->where("projects.projects_deleted", 0);
+     $DBLIB->join("clients", "projects.clients_id=clients.clients_id", "LEFT");
+diff --git a/src/user.php b/src/user.php
+index f188dc03..9d15b14f 100644
+--- a/src/user.php
++++ b/src/user.php
+@@ -48,6 +48,7 @@ $DBLIB->orderBy("projects.projects_dates_use_start", "ASC");
+ $DBLIB->orderBy("projects.projects_dates_use_end", "ASC");
+ $DBLIB->orderBy("projects.projects_name", "ASC");
+ $DBLIB->where("projects.instances_id",  $AUTH->data['instance']['instances_id']);
++nopayneProjectScopeWhere(); // No Payne fork: per-project access control
+ $PAGEDATA['user']['crewAssignments'] = $DBLIB->get("crewAssignments", null, ["crewAssignments.*", "projects.projects_dates_use_start", "projects.projects_dates_use_end", "projects.projects_name", "clients.clients_name", "projects.projects_id", "projectsStatuses.projectsStatuses_name", "projectsStatuses.projectsStatuses_foregroundColour","projectsStatuses.projectsStatuses_backgroundColour"]);
+ 
+ //Project Manager Roles
+@@ -55,6 +56,7 @@ $DBLIB->join("clients", "projects.clients_id=clients.clients_id", "LEFT");
+ $DBLIB->join("projectsStatuses", "projects.projectsStatuses_id=projectsStatuses.projectsStatuses_id", "LEFT");
+ $DBLIB->where("projectsStatuses.projectsStatuses_assetsReleased", 0);
+ $DBLIB->where("projects.projects_manager",  $PAGEDATA['user']['users_userid']);
++nopayneProjectScopeWhere(); // No Payne fork: per-project access control
+ $DBLIB->orderBy("projects.projects_dates_use_start", "ASC");
+ $DBLIB->where("projects.instances_id",  $AUTH->data['instance']['instances_id']);
+ $DBLIB->orderBy("projects.projects_dates_use_end", "ASC");
+-- 
+2.47.3
+

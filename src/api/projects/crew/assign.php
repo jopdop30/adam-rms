@@ -45,6 +45,7 @@ foreach ($_POST['users'] as $user) {
             $DBLIB->where("projectsStatuses.projectsStatuses_assetsReleased", 0);
             $DBLIB->where("((projects_dates_use_start >= '" . $project["projects_dates_use_start"] . "' AND projects_dates_use_start <= '" . $project["projects_dates_use_end"] . "') OR (projects_dates_use_end >= '" . $project["projects_dates_use_start"] . "' AND projects_dates_use_end <= '" . $project["projects_dates_use_end"] . "') OR (projects_dates_use_end >= '" . $project["projects_dates_use_end"] . "' AND projects_dates_use_start <= '" . $project["projects_dates_use_start"] . "'))");
             $existingAssignments = $DBLIB->get("crewAssignments", null, ["crewAssignments.projects_id", "projects.projects_name", "crewAssignments.crewAssignments_role"]);
+            nopayneProjectScopeRedact($existingAssignments); // No Payne fork: per-project access control
         } else $existingAssignments = [];
         //Allow crew to be clashed - but it'll warn them in the notification.
     } else {

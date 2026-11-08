@@ -13,6 +13,7 @@ $DBLIB->join("projects","projectsVacantRoles.projects_id=projects.projects_id","
 $DBLIB->join("clients", "projects.clients_id=clients.clients_id", "LEFT");
 $DBLIB->join("users", "projects.projects_manager=users.users_userid", "LEFT");
 $DBLIB->where("projects.instances_id", $AUTH->data['instance']['instances_id']);
+nopayneProjectScopeWhere(); // No Payne fork: per-project access control
 $DBLIB->where("projects.projects_deleted", 0);
 $DBLIB->where("projects.projects_archived", 0);
 $DBLIB->where("(projects.projects_dates_use_end IS NULL OR projects.projects_dates_use_end >= '" . date("Y-m-d H:i:s") . "')");
@@ -34,6 +35,7 @@ foreach($roles as $role) {
     //get parent project if set
     if ($role['projects_parent_project_id']) {
         $DBLIB->where("projects_id",$role['projects_parent_project_id']);
+        nopayneProjectScopeWhere("projects_id"); // No Payne fork: don't name a parent project out of scope
         $DBLIB->where("projects_deleted",0);
         $DBLIB->where("projects_archived",0);
         $role['parentProject'] = $DBLIB->getOne("projects",["projects_id","projects_name"]);

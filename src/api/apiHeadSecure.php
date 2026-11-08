@@ -27,3 +27,4 @@ $DBLIB->insert("analyticsEvents", [
     "analyticsEvents_action" => "API-CALL",
     "analyticsEvents_payload" => ($analyticsPayload !== null && strlen($analyticsPayload) > 65535) ? null : $analyticsPayload,
 ]);
+nopayneProjectScopeRequestGuard(); // No Payne fork: per-project access control

@@ -69,6 +69,7 @@ if ($CONFIG['LINKS_TERMSOFSERVICEURL'] and ($PAGEDATA['USERDATA']['users_termsAc
     }
     //get all projects
     $DBLIB->where("projects.instances_id", $AUTH->data['instance']['instances_id']);
+    nopayneProjectScopeWhere(); // No Payne fork: per-project access control
     $DBLIB->where("projects.projects_deleted", 0);
     $DBLIB->where("projects.projects_archived", 0);
     $DBLIB->join("clients", "projects.clients_id=clients.clients_id", "LEFT");
@@ -81,7 +82,7 @@ if ($CONFIG['LINKS_TERMSOFSERVICEURL'] and ($PAGEDATA['USERDATA']['users_termsAc
     $PAGEDATA['projects'] = [];
     $tempProjectKeys = []; //Track the Project IDs of all projects and their place in the array (allows us to preserve sorting)
     foreach ($projects as $index => $project) {
-        if ($project['projects_parent_project_id'] == null) {
+        if (nopayneProjectScopeTopLevel($project['projects_parent_project_id'])) { // No Payne fork: was == null
             $project['subProjects'] = [];
             $tempProjectKeys[$project['projects_id']] = count($PAGEDATA['projects']);
             $PAGEDATA['projects'][] = $project;
@@ -130,3 +131,4 @@ if ($CONFIG['LINKS_TERMSOFSERVICEURL'] and ($PAGEDATA['USERDATA']['users_termsAc
     $PAGEDATA['pageConfig'] = ["TITLE" => "No Businesses", "BREADCRUMB" => false, "NOMENU" => true];
     die($TWIG->render('index_noInstances.twig', $PAGEDATA));
 }
+nopayneProjectScopeRequestGuard(); // No Payne fork: per-project access control

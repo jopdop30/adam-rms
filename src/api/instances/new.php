@@ -30,7 +30,7 @@ $position = $DBLIB->insert("instancePositions", [
     "instances_id" => $instance,
     "instancePositions_displayName" => "Administrator",
     "instancePositions_rank" => 1,
-    "instancePositions_actions" => implode(",", array_keys($instanceActions))
+    "instancePositions_actions" => implode(",", array_diff(array_keys($instanceActions), [NOPAYNE_PROJECT_SCOPE_PERMISSION])) // No Payne fork: the restriction isn't a grant
 ]);
 if (!$position) finish(false, ["code" => "CREATE-POSITION-FAIL", "message" => "Could not create new business"]);
 
