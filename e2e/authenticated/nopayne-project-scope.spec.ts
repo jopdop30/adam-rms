@@ -247,27 +247,34 @@ const writes: WriteCase[] = [
 test.describe("changing another project", () => {
   for (const [i, c] of writes.entries()) {
     test(`${c.endpoint} (${i}) leaves another project alone`, async ({ asRestricted, asA, tenants: { a }, scope }) => {
-      const before = snapshot(a.instanceId);
-      const response = await asRestricted.api(c.endpoint, c.params(a, scope));
-      const after = snapshot(a.instanceId);
-      expect(refused(response), response.body.slice(0, 500)).toBe(true);
-      expect(after).toEqual(before);
+      // Reseeded even if the test fails, so a request that got through can't leave A changed for later tests
+      try {
+        const before = snapshot(a.instanceId);
+        const response = await asRestricted.api(c.endpoint, c.params(a, scope));
+        const after = snapshot(a.instanceId);
+        expect(refused(response), response.body.slice(0, 500)).toBe(true);
+        expect(after).toEqual(before);
 
-      // Control: the same request from an unrestricted user does change something
-      await asA.api(c.endpoint, c.params(a, scope));
-      expect(snapshot(a.instanceId), "control: the full user's request changes A's records").not.toEqual(before);
-      reseed();
+        // Control: the same request from an unrestricted user does change something
+        await asA.api(c.endpoint, c.params(a, scope));
+        expect(snapshot(a.instanceId), "control: the full user's request changes A's records").not.toEqual(before);
+      } finally {
+        reseed();
+      }
     });
   }
 
-  test("the user can still change their own projects", async ({ asRestricted, tenants: { a }, scope }) => {
-    for (const id of [scope.projects.own, scope.projects.managed]) {
-      const renamed = await asRestricted.api("/api/projects/changeDescription.php", { projects_id: id, projects_description: `nopayne changed ${id}` });
-      expect(succeeded(renamed), renamed.body.slice(0, 500)).toBe(true);
-      const note = await asRestricted.api("/api/projects/newNote.php", { projects_id: id, projectsNotes_title: "nopayne note" });
-      expect(succeeded(note), note.body.slice(0, 500)).toBe(true);
+  test("the user can still change their own projects", async ({ asRestricted, scope }) => {
+    try {
+      for (const id of [scope.projects.own, scope.projects.managed]) {
+        const renamed = await asRestricted.api("/api/projects/changeDescription.php", { projects_id: id, projects_description: `nopayne changed ${id}` });
+        expect(succeeded(renamed), renamed.body.slice(0, 500)).toBe(true);
+        const note = await asRestricted.api("/api/projects/newNote.php", { projects_id: id, projectsNotes_title: "nopayne note" });
+        expect(succeeded(note), note.body.slice(0, 500)).toBe(true);
+      }
+    } finally {
+      reseed();
     }
-    reseed();
   });
 });
 
@@ -275,34 +282,42 @@ test.describe("adding and removing assets", () => {
   for (const who of ["asClient", "asRestricted"] as const) {
     test(`${who === "asClient" ? "the client role" : "the restricted user"} can add an asset to their project and take it off again`, async ({ asClient, asRestricted, tenants: { a }, scope }) => {
       const session = who === "asClient" ? asClient : asRestricted;
-      const added = await session.api("/api/projects/assets/assign.php", { projects_id: scope.projects.own, assets_id: a.spareAssetId });
-      expect(succeeded(added), added.body.slice(0, 500)).toBe(true);
-      expect(bookings(a.spareAssetId)).toEqual([scope.projects.own]);
+      try {
+        const added = await session.api("/api/projects/assets/assign.php", { projects_id: scope.projects.own, assets_id: a.spareAssetId });
+        expect(succeeded(added), added.body.slice(0, 500)).toBe(true);
+        expect(bookings(a.spareAssetId)).toEqual([scope.projects.own]);
 
-      // The project page lists it
-      expect(mentions(await session.page(`/project/?id=${scope.projects.own}`), a.spareAssetTag)).toBe(true);
+        // The project page lists it
+        expect(mentions(await session.page(`/project/?id=${scope.projects.own}`), a.spareAssetTag)).toBe(true);
 
-      // As the assets page's basket button removes it
-      const removed = await session.api("/api/projects/assets/unassign.php", { assets_id: a.spareAssetId, projects_id: scope.projects.own });
-      expect(succeeded(removed), removed.body.slice(0, 500)).toBe(true);
-      expect(bookings(a.spareAssetId)).toEqual([]);
-      reseed();
+        // As the assets page's basket button removes it
+        const removed = await session.api("/api/projects/assets/unassign.php", { assets_id: a.spareAssetId, projects_id: scope.projects.own });
+        expect(succeeded(removed), removed.body.slice(0, 500)).toBe(true);
+        expect(bookings(a.spareAssetId)).toEqual([]);
+      } finally {
+        reseed();
+      }
     });
   }
 
   test("the client role can't add an asset to, or take one off, another project", async ({ asClient, tenants: { a } }) => {
-    const before = snapshot(a.instanceId);
-    for (const [endpoint, params] of [
-      ["/api/projects/assets/assign.php", { projects_id: a.projectId, assets_id: a.spareAssetId }],
-      ["/api/projects/assets/assign.php", { projects_id: a.projectId, assetTypes_id: a.assetTypeId }],
-      ["/api/projects/assets/unassign.php", { assetsAssignments: [a.assignmentId] }],
-      ["/api/projects/assets/unassign.php", { assets_id: a.assetId, projects_id: a.projectId }],
-    ] as [string, Params][]) {
-      const response = await asClient.api(endpoint, params);
-      expect(refused(response), `${endpoint}: ${response.body.slice(0, 500)}`).toBe(true);
+    try {
+      const before = snapshot(a.instanceId);
+      const booked = [bookings(a.spareAssetId), bookings(a.assetId)];
+      for (const [endpoint, params] of [
+        ["/api/projects/assets/assign.php", { projects_id: a.projectId, assets_id: a.spareAssetId }],
+        ["/api/projects/assets/assign.php", { projects_id: a.projectId, assetTypes_id: a.assetTypeId }],
+        ["/api/projects/assets/unassign.php", { assetsAssignments: [a.assignmentId] }],
+        ["/api/projects/assets/unassign.php", { assets_id: a.assetId, projects_id: a.projectId }],
+      ] as [string, Params][]) {
+        const response = await asClient.api(endpoint, params);
+        expect(refused(response), `${endpoint}: ${response.body.slice(0, 500)}`).toBe(true);
+      }
+      expect(snapshot(a.instanceId)).toEqual(before);
+      expect([bookings(a.spareAssetId), bookings(a.assetId)]).toEqual(booked);
+      expect(bookings(a.assetId)).toContain(a.projectId);
+    } finally {
+      reseed();
     }
-    expect(snapshot(a.instanceId)).toEqual(before);
-    expect(bookings(a.spareAssetId)).toEqual([]);
-    expect(bookings(a.assetId)).toEqual([a.projectId]);
   });
 });
