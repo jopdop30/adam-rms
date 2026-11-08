@@ -1,5 +1,7 @@
 # AdamRMS
 
+> **No Payne fork.** This is No Payne Productions' fork, with per-project access control added. See [NOPAYNE-FORK.md](NOPAYNE-FORK.md) for what's changed, how to upgrade and how to deploy.
+
 [![GitHub release (latest by date)](https://img.shields.io/github/v/release/adam-rms/adam-rms)](https://github.com/adam-rms/adam-rms/releases)
 [![GitHub](https://img.shields.io/github/license/adam-rms/adam-rms)](LICENSE)
 [![GitHub issues](https://img.shields.io/github/issues/adam-rms/adam-rms)](https://github.com/adam-rms/adam-rms/issues)
