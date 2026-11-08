@@ -35,6 +35,7 @@ foreach($roles as $role) {
     //get parent project if set
     if ($role['projects_parent_project_id']) {
         $DBLIB->where("projects_id",$role['projects_parent_project_id']);
+        nopayneProjectScopeWhere("projects_id"); // No Payne fork: don't name a parent project out of scope
         $DBLIB->where("projects_deleted",0);
         $DBLIB->where("projects_archived",0);
         $role['parentProject'] = $DBLIB->getOne("projects",["projects_id","projects_name"]);

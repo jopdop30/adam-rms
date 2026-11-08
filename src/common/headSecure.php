@@ -82,7 +82,7 @@ if ($CONFIG['LINKS_TERMSOFSERVICEURL'] and ($PAGEDATA['USERDATA']['users_termsAc
     $PAGEDATA['projects'] = [];
     $tempProjectKeys = []; //Track the Project IDs of all projects and their place in the array (allows us to preserve sorting)
     foreach ($projects as $index => $project) {
-        if ($project['projects_parent_project_id'] == null) {
+        if (nopayneProjectScopeTopLevel($project['projects_parent_project_id'])) { // No Payne fork: was == null
             $project['subProjects'] = [];
             $tempProjectKeys[$project['projects_id']] = count($PAGEDATA['projects']);
             $PAGEDATA['projects'][] = $project;

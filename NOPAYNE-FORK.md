@@ -2,7 +2,7 @@
 
 This is No Payne Productions' fork of [AdamRMS](https://github.com/adam-rms/adam-rms), run at
 our AdamRMS instance. It adds one feature, **per-project access control**, so an outside client can have an
-account that only sees and changes the project(s) they are on.
+account that only sees and changes the project(s) they are on, and those projects' sub-projects.
 
 ## 1. Purpose, base version and branches
 
@@ -27,11 +27,11 @@ two-line hook ending in the comment `// No Payne fork`, so `git grep -n "No Payn
 | `src/common/libs/Auth/nopayneProjectScope.php` | **New.** The feature: who is restricted, which projects they can reach, the request guard, the list filter, the name redaction. | (whole file) |
 | `src/common/libs/Auth/instanceActions.php` | Defines the new permission `PROJECTS:VIEW:ONLY_ASSIGNED` (after `PROJECTS:VIEW`). | the `'PROJECTS:VIEW:ONLY_ASSIGNED' => [...]` entry (12 lines) |
 | `src/common/head.php` | Loads the helper after `$AUTH` is created, so every page and API has it. | `require_once __DIR__ . '/libs/Auth/nopayneProjectScope.php';` |
-| `src/common/headSecure.php` | Sidebar project list (also used by the dashboard calendar, the parent-project picker and the new-project form) filtered; request guard for every logged-in page. | `nopayneProjectScopeWhere();` in the "get all projects" query; `nopayneProjectScopeRequestGuard();` as the last line |
+| `src/common/headSecure.php` | Sidebar project list (also used by the dashboard calendar, the parent-project picker and the new-project form) filtered, and a sub-project whose parent the user can't reach listed at top level; request guard for every logged-in page. | `nopayneProjectScopeWhere();` in the "get all projects" query; `nopayneProjectScopeTopLevel(...)` in place of `== null` where it picks out top-level projects; `nopayneProjectScopeRequestGuard();` as the last line |
 | `src/api/apiHeadSecure.php` | Request guard for every logged-in API endpoint (web and mobile app). | `nopayneProjectScopeRequestGuard();` as the last line |
 | `src/api/file/index.php` | File downloads use `apiHead.php`, not `apiHeadSecure.php`, so they need their own guard (project files, invoices, quotes, delivery notes, payment files). | `nopayneProjectScopeRequestGuard();` after the `require_once` |
-| `src/api/projects/list.php` | Project list API (mobile app, pickers) filtered, top level and sub-projects. | `nopayneProjectScopeWhere();` ×2 |
-| `src/project/list.php` | Projects page filtered, top level and sub-projects. | `nopayneProjectScopeWhere();` ×2 |
+| `src/api/projects/list.php` | Project list API (mobile app, pickers) filtered, top level and sub-projects; a sub-project whose parent the user can't reach is listed at top level. | `nopayneProjectScopeWhere();` ×2; `nopayneProjectScopeTopLevelWhere();` in place of `where("projects.projects_parent_project_id IS NULL")` |
+| `src/project/list.php` | Projects page filtered, top level and sub-projects; a sub-project whose parent the user can't reach is listed at top level. | `nopayneProjectScopeWhere();` ×2; `nopayneProjectScopeTopLevelWhere();` in place of `where("projects.projects_parent_project_id IS NULL")` |
 | `src/api/projects/data.php` | A project's sub-projects (and their assets and money) are only shown if the user can reach them. | `nopayneProjectScopeWhere();` before the sub-project query |
 | `src/common/libs/Search/SearchProjects.php` | Global search (search page and `/api/search/search.php`). | `nopayneProjectScopeWhere();` |
 | `src/assets.php` | "Project to assign assets to" dropdown filtered; "Assigned to &lt;project&gt;" on unavailable assets says "another project" instead of naming it. | `nopayneProjectScopeWhere();` in the dropdown query; `nopayneProjectScopeRedact($tag['assignment']);` |
@@ -41,11 +41,11 @@ two-line hook ending in the comment `// No Payne fork`, so `git grep -n "No Payn
 | `src/ledger.php` | Payments ledger only lists payments on the user's projects. | `nopayneProjectScopeWhere();` |
 | `src/user.php` | A user's page lists only the crew roles and managed projects the viewer can reach. | `nopayneProjectScopeWhere();` ×2 |
 | `src/clients.php` | Client totals only add up the user's projects. | `nopayneProjectScopeWhere();` |
-| `src/project/crew/vacancies.php` | Crew vacancies only on the user's projects. | `nopayneProjectScopeWhere();` |
+| `src/project/crew/vacancies.php` | Crew vacancies only on the user's projects, and a vacancy on a sub-project doesn't name a parent the user can't reach. | `nopayneProjectScopeWhere();` ×2 |
 | `src/api/instances/new.php` | A new business's "Administrator" role is created with every permission; this leaves the restriction out. | `array_diff(array_keys($instanceActions), [NOPAYNE_PROJECT_SCOPE_PERMISSION])` |
 | `e2e/setup/tenants.php` | Same as above for the test businesses' "full access" role, so existing tests keep testing unrestricted users. | `array_diff(array_keys($instanceActions), ["PROJECTS:VIEW:ONLY_ASSIGNED"])` |
-| `e2e/setup/nopayneProjectScope.php` | **New.** Test data: a restricted user with every other permission, a "client" user with the role No Payne gives clients, and their projects. | (whole file) |
-| `e2e/authenticated/nopayne-project-scope.spec.ts` | **New.** 70 tests (see section 4). | (whole file) |
+| `e2e/setup/nopayneProjectScope.php` | **New.** Test data: a restricted user with every other permission, a "client" user with the role No Payne gives clients, their projects, and sub-projects (children and grandchildren of their projects, and a parent they aren't on with a child they are crew on). | (whole file) |
+| `e2e/authenticated/nopayne-project-scope.spec.ts` | **New.** 84 tests (see section 4). | (whole file) |
 | `.github/workflows/e2e-tests.yml` | Run the e2e suite on pull requests into `nopayne` as well as `main`. | `- nopayne` under `pull_request.branches` |
 | `.github/workflows/nopayne-image.yml` | **New.** Builds and pushes the production image on `nopayne-v*` tags (see section 6). | (whole file) |
 | `NOPAYNE-FORK.md` | **New.** This file. | (whole file) |
@@ -59,8 +59,15 @@ No database schema changes and no migrations.
 - **Who is restricted:** a user whose role (or extra permissions) in the current business includes
   `PROJECTS:VIEW:ONLY_ASSIGNED`. Server admins with `INSTANCES:FULL_PERMISSIONS_IN_INSTANCE` never are.
 - **What they can reach:** projects in that business, not deleted, where they are `projects_manager` or have a
-  non-deleted `crewAssignments` row. There is no other "lead" or "linked user" field on projects. Sub-projects
-  are not included automatically: the user must be manager or crew on the sub-project itself.
+  non-deleted `crewAssignments` row (there is no other "lead" or "linked user" field on projects), **plus every
+  sub-project of those, to any depth** (`projects_parent_project_id`, following non-deleted sub-projects only).
+  The lookup follows only IDs it hasn't seen, so a cycle of parents (stock doesn't prevent one) can't loop.
+  It only goes down: being on a sub-project doesn't reach its parent or its siblings.
+- **Sub-projects whose parent is out of reach:** the sidebar, the projects page and `api/projects/list.php` nest
+  sub-projects under their parents, one level deep. For a restricted user, a sub-project whose parent they can't
+  reach is listed at top level instead of vanishing (`nopayneProjectScopeTopLevel()` /
+  `nopayneProjectScopeTopLevelWhere()`). As in stock, grandchildren aren't in those nested lists for anyone;
+  they're in search, the business calendar and the flat `api/projects/list.php`, and on their parent's page.
 - **Request guard:** before any page or API code runs, it collects every project the request refers to and
   refuses the request (404 page, or `{"result":false,"error":{"code":"AUTH-ERROR"}}` from the API) if one is out
   of scope. It looks at `$_GET`, `$_POST` and `formData`:
@@ -91,7 +98,12 @@ and `grep -rln "projects_name\|join(\"projects\"" src`:
 | `api/projects/`: archive, unArchive, delete, changeClient, changeDeliveryNotes, changeDescription, changeInvoiceNotes, changeName, changeProjectDates, changeProjectDeliverDates, changeProjectFinanceDurationMaths, changeProjectManager, changeProjectType, changeStatus, changeVenue, followParentStatus, getComments, newNote, editNote, newQuickComment | Guard (`projects_id`) |
 | `api/projects/changeSubProject.php`, `new.php` | Guard (`projects_id`, `projects_parent_project_id`) |
 | `api/projects/newPayment.php` / `deletePayment.php` | Guard (`projects_id` in formData / `payments_id`) |
-| `api/projects/data.php` (project page data, comments, files, quotes, invoices, delivery notes, payments) | Guard (`id`, formData `id`); sub-projects filtered |
+| `api/projects/data.php` (project page data, comments, files, quotes, invoices, delivery notes, payments) | Guard (`id`, formData `id`); sub-projects filtered (a no-op since sub-projects of a reachable project are reachable, kept as a safety net) |
+| `api/projects/archive.php`, `unArchive.php`, `delete.php`, `changeStatus.php` (act on the project's sub-projects too) | No change: the sub-projects of a reachable project are reachable |
+| `api/projects/followParentStatus.php` | No change: copies the parent's status ID onto a reachable sub-project, returns nothing about the parent |
+| `api/projects/changeSubProject.php` | Guard on both IDs, so a project can only be moved under a parent the user reaches; `-1` (detach) is allowed on a reachable project, as in stock |
+| `common/headSecure.php` sidebar, `project/list.php`, `api/projects/list.php` (nesting) | A sub-project whose parent is out of reach is listed at top level |
+| `project/crew/vacancies.php` (parent project name) | Parent's name only shown if the user reaches it |
 | `api/projects/assets/`: assign, setStatusBarcode, setStatusByTag, statusList | Guard (`projects_id`) |
 | `api/projects/assets/`: setComment, setDiscount, setPrice, unassign | Guard (`assetsAssignments[]`, and `projects_id` when unassigning by asset/type) |
 | `api/projects/assets/setStatus.php`, `swap.php`, `api/assets/substitutions.php` | Guard (`assetsAssignments_id`) |
@@ -114,7 +126,8 @@ and `grep -rln "projects_name\|join(\"projects\"" src`:
 | `api/instances/new.php` | New businesses' Administrator role doesn't get the restriction |
 | `api/account/calendar-export.php` (personal iCal) | No change: only the user's own crew assignments, which are in scope |
 | `api/instances/calendar-export.php` (business iCal) | No change to the endpoint: it's keyed by the business's calendar key, which is now hidden from restricted users |
-| `assets/widgets/statsWidgets.php` | No change: `myCalendar` is the user's own crew roles; the inventory value widgets are business-wide asset totals, not project data (see open question about values) |
+| `assets/widgets/statsWidgets.php` | No change: `myCalendar` is the user's own crew roles; the inventory value widgets are business-wide asset totals, not project data (accepted, see "Decisions" below) |
+| `user.php` (projects the user manages) | Filtered; that list is top-level projects only, so a reachable sub-project whose parent isn't is left out there (it's on the sidebar, projects page and search) |
 | `public/embed/jobs.php` | No change: public page of vacancies the business chose to publish |
 | `instances/billing.php`, `projectStatuses.php`, `projectTypes.php` | No change: counts only, behind business-settings permissions |
 | `server/instances.php`, `server/analytics/tables.php` | No change: server admins only |
@@ -125,7 +138,7 @@ and `grep -rln "projects_name\|join(\"projects\"" src`:
 
 | Key | Shown as | Effect |
 |---|---|---|
-| `PROJECTS:VIEW:ONLY_ASSIGNED` | Projects: View - Only Assigned | **Takes access away.** The user can only see and change projects they manage or are crew on. Needs `PROJECTS:VIEW`. |
+| `PROJECTS:VIEW:ONLY_ASSIGNED` | Projects: View - Only Assigned | **Takes access away.** The user can only see and change projects they manage or are crew on, and those projects' sub-projects. Needs `PROJECTS:VIEW`. |
 
 To set up a client account (e.g. an outside client):
 
@@ -138,9 +151,18 @@ To set up a client account (e.g. an outside client):
    Don't give it client, ledger, user-list or business-settings permissions unless they need them: those are
    business-wide, as in stock AdamRMS.
 2. **Business settings > Users**: add the user with that role.
-3. On the client's project, either make them **crew** (Crew tab) or the **project manager**.
+3. On the client's project, either make them **crew** (Crew tab) or the **project manager**. That also gives
+   them every sub-project of it. To give them only a sub-project, put them on the sub-project, not the parent.
 
 Every other role is unchanged. Don't tick the new permission on the Administrator role.
+
+### Decisions
+
+- **Sub-projects:** manager or crew on a parent project reaches all its sub-projects, to any depth. Being on a
+  sub-project doesn't give the parent or the sibling sub-projects.
+- **Inventory values:** restricted users still see inventory purchase/replacement values and day/week rates on
+  the assets pages (stock `assets.php` has no permission check for them), and the dashboard's total asset value.
+  Accepted; no "hide purchase value" permission will be built.
 
 ## 4. Upgrading to a new upstream release
 
@@ -163,6 +185,9 @@ line back in the same place:
 - `src/common/headSecure.php` and `src/api/apiHeadSecure.php`: our guard is the **last line**. If upstream adds
   code at the end, the guard goes after it.
 - `src/common/head.php`: the `require_once` must stay after `$GLOBALS['AUTH'] = new bID;`.
+- `headSecure.php`, `project/list.php`, `api/projects/list.php`: the top-level test (`== null` /
+  `projects_parent_project_id IS NULL`) is replaced by our helper, not added to. If upstream changes that line,
+  re-apply the replacement.
 - Project queries (`list.php` ×2, `data.php`, `assets.php`, `calendar.php`, `ledger.php`, `user.php`,
   `clients.php`, `vacancies.php`, `SearchProjects.php`): `nopayneProjectScopeWhere()` must be called after the
   query's other `where()`s start and before its `get()`/`paginate()`.
@@ -173,7 +198,7 @@ line back in the same place:
 Then check nothing was lost, and audit what upstream added:
 
 ```bash
-git grep -n "No Payne fork" -- src e2e .github   # 24 hooks in src/ (plus the helper), 1 in e2e/setup/tenants.php, 1 in e2e-tests.yml
+git grep -n "No Payne fork" -- src e2e .github   # 28 hooks in src/ (plus the helper), 1 in e2e/setup/tenants.php, 1 in e2e-tests.yml
 # New or changed files that take a project ID or list projects need a look (see the audit table in section 2)
 git diff --name-only vOLD vX.Y.Z -- src | xargs grep -lE "projects_id|join\(\"projects\"|assetsAssignments|crewAssignments|payments_id|projectsVacantRoles|s3files_id" 2>/dev/null
 ```
@@ -198,11 +223,14 @@ Merge when green, then tag and deploy (section 6).
 **Checklist after an upgrade** (on staging, or production right after deploying). Log in as the client user
 (restricted role, crew on one project) and check:
 
-- [ ] Sidebar, dashboard calendar, **Projects** page, business calendar and search show only their project(s).
-- [ ] Their project opens and shows its gear with prices.
+- [ ] Sidebar, dashboard calendar, **Projects** page, business calendar and search show only their project(s)
+      and those projects' sub-projects.
+- [ ] Their project opens and shows its gear with prices. A sub-project of it opens too.
+- [ ] Put the client as crew on a sub-project only (of a project they aren't on): the sub-project shows at top
+      level in the sidebar and **Projects** page and opens; its parent's URL gives a 404. Take them off again.
 - [ ] **Assets** page: the "Project to assign assets to" dropdown lists only their project(s); adding an asset
       with the basket button works, and removing it works.
-- [ ] Another project's URL, `/project/?id=<other id>`, gives a 404.
+- [ ] Another project's URL, `/project/?id=<other id>`, gives a 404 (including a sibling of a sub-project they're on).
 - [ ] The business calendar page shows no iCal subscription URL with a key in it.
 
 And from the browser's developer console while logged in as the client (each must return
@@ -220,8 +248,9 @@ Finally log in as an admin and check you still see every project.
 
 ## 5. `patches/`
 
-`patches/` holds `git format-patch v1.205.6..<last feature commit> -o patches/`: every commit of ours except the
-commit that adds `patches/` itself. To re-apply the fork to a fresh checkout of an upstream release:
+`patches/` holds a `git format-patch` export of every commit of ours except the ones that only update
+`patches/` (they're cherry-picked, oldest first, onto a scratch branch from the upstream tag and exported from
+there, as below). To re-apply the fork to a fresh checkout of an upstream release:
 
 ```bash
 git clone https://github.com/adam-rms/adam-rms.git && cd adam-rms

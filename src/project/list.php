@@ -40,7 +40,7 @@ $DBLIB->pageLimit = (isset($_GET['pageLimit']) ? $_GET['pageLimit'] : 30);
 $DBLIB->where("projects.instances_id", $AUTH->data['instance']['instances_id']);
 nopayneProjectScopeWhere(); // No Payne fork: per-project access control
 $DBLIB->where("projects.projects_deleted", 0);
-$DBLIB->where("projects.projects_parent_project_id IS NULL");
+nopayneProjectScopeTopLevelWhere(); // No Payne fork: was $DBLIB->where("projects.projects_parent_project_id IS NULL");
 if (strlen($PAGEDATA['search']) > 0) {
     //Search
     $DBLIB->where("(

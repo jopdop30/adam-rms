@@ -3,7 +3,7 @@ import path from "path";
 import { APP_ENV, BASE_URL, PHP_BINARY } from "../env";
 import { bookings } from "../projects";
 import {
-  test as base, expect, formData, mentions, newSession, seedTenants, snapshot, succeeded,
+  test as base, dbQuery, expect, formData, mentions, newSession, seedTenants, snapshot, succeeded,
   type Params, type Result, type Session, type Tenant, type Tenants,
 } from "../tenants";
 
@@ -14,14 +14,21 @@ import {
  *   - "client": the role No Payne gives a client (view projects, add/remove assets, view crew and asset types)
  *   - an "own" project both are crew on, and a "managed" project "restricted" manages.
  * A's seeded project and sub-project (managed by A's full user, no crew from here) are the ones they must not reach.
+ * Sub-projects (managed by A's full user, so access can only come from the parent):
+ *   own > ownChild > ownGrandchild, managed > managedChild > managedGrandchild, and outer > outerChild, outerSibling,
+ *   where both users are crew on outerChild only.
  * Each refusal has a control: A's full-access user, who isn't restricted, can make the same request.
  */
 
 type Scope = {
   users: { restricted: { id: number; email: string }; client: { id: number; email: string } };
   positions: { restricted: number; client: number };
-  projects: { own: number; managed: number };
+  projects: {
+    own: number; managed: number; ownChild: number; ownGrandchild: number; managedChild: number; managedGrandchild: number;
+    outer: number; outerChild: number; outerSibling: number;
+  };
 };
+type Kind = keyof Scope["projects"];
 
 let lastScope: Scope | undefined;
 /** Passes the IDs from the last call back in, so records are found even if a test changed them, and IDs don't change */
@@ -76,7 +83,11 @@ test.describe("listing projects", () => {
       const response = await asRestricted.api("/api/projects/list.php", params);
       expect(response.json?.result, response.body.slice(0, 500)).toBe(true);
       const ids = response.json.response.flatMap((p: { projects_id: number; subprojects: { projects_id: number }[] }) => [p.projects_id, ...p.subprojects.map((s) => s.projects_id)]);
-      expect(ids.sort()).toEqual([scope.projects.own, scope.projects.managed].sort());
+      // Sub-projects of the user's projects are theirs too; nested lists only go one level deep, as in stock
+      const kinds: Kind[] = params.subprojects
+        ? ["own", "managed", "ownChild", "managedChild", "outerChild"]
+        : ["own", "managed", "ownChild", "ownGrandchild", "managedChild", "managedGrandchild", "outerChild"];
+      expect(ids.sort()).toEqual(kinds.map((k) => scope.projects[k]).sort());
     }
     // Control: unrestricted users still see every project
     const all = await asA.api("/api/projects/list.php", {});
@@ -316,6 +327,139 @@ test.describe("adding and removing assets", () => {
       expect(snapshot(a.instanceId)).toEqual(before);
       expect([bookings(a.spareAssetId), bookings(a.assetId)]).toEqual(booked);
       expect(bookings(a.assetId)).toContain(a.projectId);
+    } finally {
+      reseed();
+    }
+  });
+});
+
+test.describe("sub-projects", () => {
+  // Manager or crew on a project reaches its sub-projects to any depth; being on a sub-project doesn't reach its parent or siblings
+  const reach: Record<"asRestricted" | "asClient", { yes: Kind[]; no: Kind[] }> = {
+    asRestricted: { yes: ["ownChild", "ownGrandchild", "managedChild", "managedGrandchild", "outerChild"], no: ["outer", "outerSibling"] },
+    asClient: { yes: ["ownChild", "ownGrandchild", "outerChild"], no: ["outer", "outerSibling", "managed", "managedChild", "managedGrandchild"] },
+  };
+
+  for (const who of ["asRestricted", "asClient"] as const) {
+    test(`${who}: sub-projects of the user's projects open, page and API, to any depth`, async ({ asRestricted, asClient, scope }) => {
+      const session = who === "asClient" ? asClient : asRestricted;
+      for (const kind of reach[who].yes) {
+        const id = scope.projects[kind];
+        const page = await session.page(`/project/?id=${id}`);
+        expect(page.status, kind).toBe(200);
+        expect(mentions(page, `nopayne ${kind} project`), kind).toBe(true);
+        const data = await session.api("/api/projects/data.php", { id });
+        expect(data.json?.result, `${kind}: ${data.body.slice(0, 500)}`).not.toBe(false);
+        expect(mentions(data, `nopayne ${kind} project description`), kind).toBe(true);
+      }
+    });
+
+    test(`${who}: a parent, sibling or unrelated project stays a 404`, async ({ asRestricted, asClient, asA, tenants: { a }, scope }) => {
+      const session = who === "asClient" ? asClient : asRestricted;
+      for (const kind of reach[who].no) {
+        const id = scope.projects[kind];
+        const page = await session.page(`/project/?id=${id}`);
+        expect(page.status, kind).toBe(404);
+        expect(mentions(page, `nopayne ${kind} project description`), kind).toBe(false);
+        const data = await session.api("/api/projects/data.php", { id });
+        expect(refused(data), `${kind}: ${data.body.slice(0, 500)}`).toBe(true);
+        expect(mentions(await asA.page(`/project/?id=${id}`), `nopayne ${kind} project description`), `control: ${kind}`).toBe(true);
+      }
+      expect((await session.page(`/project/?id=${a.subProjectId}`)).status, "A's seeded sub-project").toBe(404);
+    });
+
+    test(`${who}: lists and search include reachable sub-projects and nothing else`, async ({ asRestricted, asClient, scope }) => {
+      const session = who === "asClient" ? asClient : asRestricted;
+      const search = await session.api("/api/search/search.php", { term: "nopayne", limit: 100 }, "GET");
+      expect(search.json?.result, search.body.slice(0, 500)).toBe(true);
+      for (const kind of reach[who].yes) expect(listsId(search, scope.projects[kind]), `search finds ${kind}`).toBe(true);
+      for (const kind of reach[who].no) expect(listsId(search, scope.projects[kind]), `search doesn't find ${kind}`).toBe(false);
+
+      const list = await session.api("/api/projects/list.php", {});
+      for (const kind of reach[who].yes) expect(listsId(list, scope.projects[kind]), `list has ${kind}`).toBe(true);
+      for (const kind of reach[who].no) expect(listsId(list, scope.projects[kind]), `list doesn't have ${kind}`).toBe(false);
+
+      // The sidebar and projects page nest sub-projects one level deep (as stock does), so grandchildren aren't in them
+      for (const url of ["/", "/project/list.php"]) {
+        const response = await session.page(url);
+        for (const kind of reach[who].yes.filter((k) => !k.endsWith("Grandchild"))) expect(linksTo(response, scope.projects[kind]), `${url} links to ${kind}`).toBe(true);
+        for (const kind of reach[who].no) expect(linksTo(response, scope.projects[kind]), `${url} doesn't link to ${kind}`).toBe(false);
+      }
+    });
+  }
+
+  test("a sub-project whose parent the user can't reach is listed at top level; unrestricted users see it nested", async ({ asRestricted, asLimitedA, scope }) => {
+    type Listed = { projects_id: number; subprojects: { projects_id: number }[] };
+    const restricted: Listed[] = (await asRestricted.api("/api/projects/list.php", { subprojects: "true" })).json.response;
+    expect(restricted.map((p) => Number(p.projects_id))).toContain(scope.projects.outerChild);
+    const full: Listed[] = (await asLimitedA.api("/api/projects/list.php", { subprojects: "true" })).json.response;
+    expect(full.map((p) => Number(p.projects_id)), "unrestricted: not at top level").not.toContain(scope.projects.outerChild);
+    const outer = full.find((p) => Number(p.projects_id) === scope.projects.outer);
+    expect(outer?.subprojects.map((s) => Number(s.projects_id)).sort()).toEqual([scope.projects.outerChild, scope.projects.outerSibling].sort());
+  });
+
+  test("unrestricted users still reach every sub-project", async ({ asLimitedA, scope }) => {
+    const list = await asLimitedA.api("/api/projects/list.php", {});
+    for (const kind of Object.keys(scope.projects) as Kind[]) expect(listsId(list, scope.projects[kind]), kind).toBe(true);
+    for (const kind of ["outer", "outerSibling", "managedGrandchild"] as Kind[]) {
+      expect((await asLimitedA.page(`/project/?id=${scope.projects[kind]}`)).status, kind).toBe(200);
+    }
+  });
+
+  test("crew only on a sub-project can't change its parent or sibling", async ({ asClient, asRestricted, tenants: { a }, scope }) => {
+    try {
+      const before = snapshot(a.instanceId);
+      for (const session of [asClient, asRestricted]) {
+        for (const kind of ["outer", "outerSibling"] as Kind[]) {
+          const response = await session.api("/api/projects/changeDescription.php", { projects_id: scope.projects[kind], projects_description: "Changed by e2e" });
+          expect(refused(response), `${kind}: ${response.body.slice(0, 500)}`).toBe(true);
+        }
+      }
+      expect(snapshot(a.instanceId)).toEqual(before);
+    } finally {
+      reseed();
+    }
+  });
+
+  for (const [who, kind] of [["asClient", "ownChild"], ["asClient", "outerChild"], ["asRestricted", "managedGrandchild"]] as const) {
+    test(`${who} can add an asset to ${kind} and take it off again`, async ({ asClient, asRestricted, tenants: { a }, scope }) => {
+      const session = who === "asClient" ? asClient : asRestricted;
+      const id = scope.projects[kind];
+      try {
+        const added = await session.api("/api/projects/assets/assign.php", { projects_id: id, assets_id: a.spareAssetId });
+        expect(succeeded(added), added.body.slice(0, 500)).toBe(true);
+        expect(bookings(a.spareAssetId)).toEqual([id]);
+        expect(mentions(await session.page(`/project/?id=${id}`), a.spareAssetTag)).toBe(true);
+        const removed = await session.api("/api/projects/assets/unassign.php", { assets_id: a.spareAssetId, projects_id: id });
+        expect(succeeded(removed), removed.body.slice(0, 500)).toBe(true);
+        expect(bookings(a.spareAssetId)).toEqual([]);
+      } finally {
+        reseed();
+      }
+    });
+  }
+
+  test("crew vacancies don't name a parent project out of scope", async ({ asRestricted, asA, tenants: { a }, scope }) => {
+    try {
+      dbQuery("UPDATE projectsVacantRoles SET projects_id = ? WHERE projectsVacantRoles_id = ?", [scope.projects.outerChild, a.vacantRoleId]);
+      const page = await asRestricted.page("/project/crew/vacancies.php");
+      expect(mentions(page, `${a.marker} vacancy`), "the vacancy on outerChild is listed").toBe(true);
+      expect(mentions(page, "nopayne outer project")).toBe(false);
+      expect(mentions(await asA.page("/project/crew/vacancies.php"), "nopayne outer project"), "control").toBe(true);
+    } finally {
+      reseed();
+    }
+  });
+
+  test("a cycle of parent projects doesn't hang the scope lookup", async ({ asRestricted, scope }) => {
+    try {
+      // managed > managedChild > managedGrandchild > managed
+      dbQuery("UPDATE projects SET projects_parent_project_id = ? WHERE projects_id = ?", [scope.projects.managedGrandchild, scope.projects.managed]);
+      expect((await asRestricted.page("/")).status).toBe(200);
+      for (const kind of ["managed", "managedChild", "managedGrandchild"] as Kind[]) {
+        expect((await asRestricted.page(`/project/?id=${scope.projects[kind]}`)).status, kind).toBe(200);
+      }
+      expect((await asRestricted.page(`/project/?id=${scope.projects.outer}`)).status).toBe(404);
     } finally {
       reseed();
     }

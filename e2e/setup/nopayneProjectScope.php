@@ -10,6 +10,11 @@
 //   - "client": what a client account would be given (the role No Payne asked for), plus the restriction.
 // Both are crew on the "own" project; "restricted" also manages the "managed" project. Neither is on A's
 // seeded project or sub-project, which are the ones they must not reach.
+// Sub-projects (all managed by A's full user, so access to them can only come from the parent):
+//   own > ownChild > ownGrandchild           reached through crew on "own"
+//   managed > managedChild > managedGrandchild   reached through managing "managed"
+//   outer > outerChild, outerSibling          both users are crew on outerChild only: they reach it, not
+//                                             "outer" or "outerSibling".
 $db = new PDO(
     "mysql:host=" . getenv('DB_HOSTNAME') . ";port=" . (getenv('DB_PORT') ?: 3306) . ";dbname=" . getenv('DB_DATABASE'),
     getenv('DB_USERNAME'),
@@ -90,9 +95,13 @@ foreach ($positions as $kind => $position) {
 $base = one("SELECT * FROM projects WHERE projects_id = ?", [$a['projectId']]);
 unset($base['projects_id']);
 $projects = [];
-foreach (["own" => $a['users']['full']['id'], "managed" => $users['restricted']['id']] as $kind => $manager) {
+$full = $a['users']['full']['id'];
+// kind => [manager, parent kind], parents first
+$tree = ["own" => [$full, null], "managed" => [$users['restricted']['id'], null], "ownChild" => [$full, "own"], "ownGrandchild" => [$full, "ownChild"],
+    "managedChild" => [$full, "managed"], "managedGrandchild" => [$full, "managedChild"], "outer" => [$full, null], "outerChild" => [$full, "outer"], "outerSibling" => [$full, "outer"]];
+foreach ($tree as $kind => [$manager, $parent]) {
     $values = array_merge($base, ["projects_name" => "nopayne $kind project", "projects_manager" => $manager, "projects_deleted" => 0, "projects_archived" => 0,
-        "projects_parent_project_id" => null, "projects_dates_deliver_start" => "2032-03-01 09:00:00", "projects_dates_deliver_end" => "2032-03-05 18:00:00",
+        "projects_parent_project_id" => $parent ? $projects[$parent] : null, "projects_status_follow_parent" => 0, "projects_dates_deliver_start" => "2032-03-01 09:00:00", "projects_dates_deliver_end" => "2032-03-05 18:00:00",
         "projects_dates_use_start" => "2032-03-02 09:00:00", "projects_dates_use_end" => "2032-03-04 18:00:00"]);
     unset($values['projects_description']);
     $projects[$kind] = upsert("projects", "projects_id", ["instances_id" => $a['instanceId'], "projects_description" => "nopayne $kind project description"], $values, $previous['projects'][$kind] ?? null);
@@ -106,14 +115,19 @@ foreach (["own" => $a['users']['full']['id'], "managed" => $users['restricted'][
     $db->prepare("UPDATE assetsAssignments SET assetsAssignments_deleted = 1 WHERE projects_id = ?")->execute([$projects[$kind]]);
 }
 // Projects tests created that these users manage (e.g. a sub-project made by new.php) would let them see more
-$db->prepare("UPDATE projects SET projects_deleted = 1 WHERE instances_id = ? AND projects_manager IN (?, ?) AND projects_id NOT IN (?, ?)")
-    ->execute([$a['instanceId'], $users['restricted']['id'], $users['client']['id'], $projects['own'], $projects['managed']]);
-// Crew: both users on "own"; no-one from these tests on anything else
+$db->prepare("UPDATE projects SET projects_deleted = 1 WHERE instances_id = ? AND projects_manager IN (?, ?) AND projects_id NOT IN (" . implode(",", array_fill(0, count($projects), "?")) . ")")
+    ->execute([$a['instanceId'], $users['restricted']['id'], $users['client']['id'], ...array_values($projects)]);
+// ...and so would sub-projects tests made under them
+$db->prepare("UPDATE projects SET projects_deleted = 1 WHERE instances_id = ? AND projects_parent_project_id IN (" . implode(",", array_fill(0, count($projects), "?")) . ") AND projects_id NOT IN (" . implode(",", array_fill(0, count($projects), "?")) . ")")
+    ->execute([$a['instanceId'], ...array_values($projects), ...array_values($projects)]);
+// Crew: both users on "own" and "outerChild"; no-one from these tests on anything else
 foreach ($users as $kind => $user) {
-    $db->prepare("UPDATE crewAssignments SET crewAssignments_deleted = 1 WHERE users_userid = ? AND projects_id != ?")->execute([$user['id'], $projects['own']]);
-    upsert("crewAssignments", "crewAssignments_id", ["projects_id" => $projects['own'], "users_userid" => $user['id']], [
-        "crewAssignments_role" => "nopayne $kind crew", "crewAssignments_comment" => null, "crewAssignments_deleted" => 0, "crewAssignments_personName" => null, "crewAssignments_rank" => 1,
-    ]);
+    $db->prepare("UPDATE crewAssignments SET crewAssignments_deleted = 1 WHERE users_userid = ? AND projects_id NOT IN (?, ?)")->execute([$user['id'], $projects['own'], $projects['outerChild']]);
+    foreach (["own", "outerChild"] as $project) {
+        upsert("crewAssignments", "crewAssignments_id", ["projects_id" => $projects[$project], "users_userid" => $user['id']], [
+            "crewAssignments_role" => "nopayne $kind crew", "crewAssignments_comment" => null, "crewAssignments_deleted" => 0, "crewAssignments_personName" => null, "crewAssignments_rank" => 1,
+        ]);
+    }
 }
 
 echo json_encode(["users" => $users, "positions" => $positions, "projects" => $projects], JSON_PRETTY_PRINT) . "\n";

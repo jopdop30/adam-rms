@@ -14,7 +14,7 @@ $DBLIB->orderBy("projects.projects_name", "ASC");
 $DBLIB->orderBy("projects.projects_created", "ASC");
 
 if (isset($_POST['subprojects'])) {
-    $DBLIB->where("projects.projects_parent_project_id IS NULL");
+    nopayneProjectScopeTopLevelWhere(); // No Payne fork: was $DBLIB->where("projects.projects_parent_project_id IS NULL");
 }
 
 $projects = $DBLIB->get("projects", null, ["projects.projects_id", "projects.projects_name", "clients.clients_name", "projects.projects_manager"]);

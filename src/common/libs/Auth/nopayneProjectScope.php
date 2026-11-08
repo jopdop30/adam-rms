@@ -3,8 +3,9 @@
  * No Payne fork: per-project access control. See NOPAYNE-FORK.md at the repo root.
  *
  * A user whose role in a business has PROJECTS:VIEW:ONLY_ASSIGNED ("restricted") can only see and touch the
- * projects in that business they manage (projects_manager) or are crew on (crewAssignments). Everyone else,
- * including server admins with INSTANCES:FULL_PERMISSIONS_IN_INSTANCE, is unaffected.
+ * projects in that business they manage (projects_manager) or are crew on (crewAssignments), and every
+ * sub-project of those (to any depth). Everyone else, including server admins with
+ * INSTANCES:FULL_PERMISSIONS_IN_INSTANCE, is unaffected.
  *
  * All the logic lives here so upstream merges only meet one-line hooks:
  *   - nopayneProjectScopeRequestGuard() runs at the end of headSecure.php / apiHeadSecure.php (and in
@@ -12,6 +13,8 @@
  *     a child record (assetsAssignments_id, payments_id, s3files_id, ...) - and refuses the request if one of
  *     them is out of scope.
  *   - nopayneProjectScopeWhere() is called before each query that lists projects, to limit it to the user's.
+ *   - nopayneProjectScopeTopLevel() / nopayneProjectScopeTopLevelWhere() list a sub-project whose parent is out
+ *     of scope at top level, where stock nests sub-projects under their parents.
  *   - nopayneProjectScopeRedact() blanks the names of other projects in rows that only mention them in passing
  *     (an asset's "assigned to X", a crew clash warning).
  *
@@ -99,7 +102,7 @@ function nopayneProjectScopeQuery(string $sql, array $params): array
     return $values;
 }
 
-/** IDs of the projects in a business the user manages or is crew on */
+/** IDs of the projects in a business the user manages or is crew on, and all their sub-projects (to any depth) */
 function nopayneProjectScopeIds($instanceId = null): array
 {
     global $AUTH;
@@ -112,6 +115,16 @@ function nopayneProjectScopeIds($instanceId = null): array
                 OR projects_id IN (SELECT projects_id FROM crewAssignments WHERE users_userid = ? AND crewAssignments_deleted = 0))",
             [$instanceId, $userId, $userId]
         ));
+        // Add sub-projects a level at a time. Only IDs not seen before are followed, so a cycle of parents ends.
+        $level = $cache[$instanceId];
+        while ($level) {
+            $children = array_map("intval", nopayneProjectScopeQuery(
+                "SELECT projects_id FROM projects WHERE instances_id = ? AND projects_deleted = 0 AND projects_parent_project_id IN (" . implode(",", $level) . ")",
+                [$instanceId]
+            ));
+            $level = array_values(array_diff($children, $cache[$instanceId]));
+            $cache[$instanceId] = array_merge($cache[$instanceId], $level);
+        }
     }
     return $cache[$instanceId];
 }
@@ -130,6 +143,26 @@ function nopayneProjectScopeWhere(string $column = "projects.projects_id"): void
     global $DBLIB;
     if (!nopayneProjectScopeRestricted()) return;
     $DBLIB->where($column, nopayneProjectScopeIds() ?: [0], "IN"); // [0] matches nothing; an empty IN () is a syntax error
+}
+
+/**
+ * Whether a project should be listed as top level: it has no parent, or (for a restricted user) its parent is
+ * out of their scope, so the sub-project they can reach doesn't vanish from lists that nest sub-projects under
+ * their parents. As the scope includes every sub-project of a project in it, a parent out of scope means the
+ * user reached this project directly.
+ */
+function nopayneProjectScopeTopLevel($parentId): bool
+{
+    if ($parentId === null) return true;
+    return nopayneProjectScopeRestricted() and !in_array((int) $parentId, nopayneProjectScopeIds(), true);
+}
+
+/** In place of stock's where("projects_parent_project_id IS NULL"): top-level projects, as nopayneProjectScopeTopLevel() defines them */
+function nopayneProjectScopeTopLevelWhere(string $column = "projects.projects_parent_project_id"): void
+{
+    global $DBLIB;
+    if (!nopayneProjectScopeRestricted()) $DBLIB->where("$column IS NULL");
+    else $DBLIB->where("($column IS NULL OR $column NOT IN (" . implode(",", nopayneProjectScopeIds() ?: [0]) . "))");
 }
 
 /** Replaces the names of projects out of the user's scope in rows (each with projects_id and projects_name) */
