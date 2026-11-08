@@ -1,7 +1,7 @@
-From 0c18b93f4b53b8847ce4c10ff19212a288b0d781 Mon Sep 17 00:00:00 2001
+From 1de875722b8c9ceaa78ff6b38a2783276cee23ca Mon Sep 17 00:00:00 2001
 From: jopdop30 <jopdop30@users.noreply.github.com>
 Date: Sun, 8 Nov 2026 11:39:04 +0000
-Subject: [PATCH 4/4] CI: e2e tests on PRs into nopayne; image build on
+Subject: [PATCH 4/5] CI: e2e tests on PRs into nopayne; image build on
  nopayne-v* tags
 
 e2e-tests.yml also runs on pull requests into nopayne. New

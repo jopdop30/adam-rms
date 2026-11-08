@@ -1,7 +1,7 @@
-From 5f96689936431cccb622ee78555d2cfdbe721bea Mon Sep 17 00:00:00 2001
+From 2978f6fce9b95d8c350315df2e5748fbc5c94f5e Mon Sep 17 00:00:00 2001
 From: jopdop30 <jopdop30@users.noreply.github.com>
 Date: Sun, 8 Nov 2026 10:39:38 +0000
-Subject: [PATCH 1/4] Per-project access control: PROJECTS:VIEW:ONLY_ASSIGNED
+Subject: [PATCH 1/5] Per-project access control: PROJECTS:VIEW:ONLY_ASSIGNED
 
 No Payne fork. A user whose role has the new instance permission
 PROJECTS:VIEW:ONLY_ASSIGNED can only see and change projects they manage or

@@ -1,7 +1,7 @@
-From 8549fd400fd805a5ac8e439cfa93e536f1a3b55f Mon Sep 17 00:00:00 2001
+From a0cbe12e7031c07b1cda46d43c934bbb30bb8def Mon Sep 17 00:00:00 2001
 From: jopdop30 <jopdop30@users.noreply.github.com>
 Date: Sun, 8 Nov 2026 10:42:10 +0000
-Subject: [PATCH 2/4] Document the No Payne fork
+Subject: [PATCH 2/5] Document the No Payne fork
 
 NOPAYNE-FORK.md: purpose, base version and branch model, every changed
 file with its hook lines, the audit, the new permission and how to grant
@@ -18,7 +18,7 @@ Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
 
 diff --git a/NOPAYNE-FORK.md b/NOPAYNE-FORK.md
 new file mode 100644
-index 00000000..7de731bf
+index 00000000..e2cfc391
 --- /dev/null
 +++ b/NOPAYNE-FORK.md
 @@ -0,0 +1,273 @@
